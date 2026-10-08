@@ -39,18 +39,17 @@ func handleRequest(conn net.Conn, dispatcher *broker.Dispatcher) error {
 		return err
 	}
 
-	responsePayload, err := dispatcher.Dispatch(request)
+	responsePayload, dispatchErr := dispatcher.Dispatch(request)
 
 	response := protocol.Response{
 		APIKey:        request.APIKey,
 		APIVersion:    request.APIVersion,
 		CorrelationID: request.CorrelationID,
-		ErrorCode:     protocol.ErrorNone,
+		ErrorCode:     errorCodeFromError(dispatchErr),
 		Payload:       responsePayload,
 	}
 
-	if err != nil {
-		response.ErrorCode = protocol.ErrorInternal
+	if dispatchErr != nil {
 		response.Payload = []byte("request failed")
 	}
 
@@ -60,4 +59,16 @@ func handleRequest(conn net.Conn, dispatcher *broker.Dispatcher) error {
 	}
 
 	return WriteFrame(conn, responseFrame)
+}
+
+func errorCodeFromError(err error) uint16 {
+	if err == nil {
+		return protocol.ErrorNone
+	}
+
+	if errors.Is(err, broker.ErrUnknownAPI) {
+		return protocol.ErrorUnknownAPI
+	}
+
+	return protocol.ErrorInternal
 }
