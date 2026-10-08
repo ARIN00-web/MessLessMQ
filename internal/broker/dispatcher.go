@@ -1,10 +1,13 @@
 package broker
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 )
+
+var ErrUnknownAPI = errors.New("unknown API key")
 
 type Dispatcher struct {
 	produceHandler Handler
@@ -27,6 +30,6 @@ func (d *Dispatcher) Dispatch(req protocol.Request) ([]byte, error) {
 		return d.consumeHandler.Handle(req)
 
 	default:
-		return nil, fmt.Errorf("unknown API key: %d", req.APIKey)
+		return nil, fmt.Errorf("%w: %d", ErrUnknownAPI, req.APIKey)
 	}
 }

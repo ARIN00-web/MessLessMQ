@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -16,7 +17,7 @@ func HandleConnection(conn net.Conn, dispatcher *broker.Dispatcher) {
 
 	for {
 		if err := handleRequest(conn, dispatcher); err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				log.Println("client disconnected:", conn.RemoteAddr())
 			} else {
 				log.Println("connection error:", err)
@@ -39,18 +40,21 @@ func handleRequest(conn net.Conn, dispatcher *broker.Dispatcher) error {
 	}
 
 	responsePayload, err := dispatcher.Dispatch(request)
-	if err != nil {
-		return err
-	}
 
-	response := protocol.Request{
+	response := protocol.Response{
 		APIKey:        request.APIKey,
 		APIVersion:    request.APIVersion,
 		CorrelationID: request.CorrelationID,
+		ErrorCode:     protocol.ErrorNone,
 		Payload:       responsePayload,
 	}
 
-	responseFrame, err := protocol.EncodeRequest(response)
+	if err != nil {
+		response.ErrorCode = protocol.ErrorInternal
+		response.Payload = []byte("request failed")
+	}
+
+	responseFrame, err := protocol.EncodeResponse(response)
 	if err != nil {
 		return err
 	}

@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -6,6 +5,7 @@ import (
 	"net"
 
 	"github.com/ARIN00-web/messlessmq/internal/network"
+	"github.com/ARIN00-web/messlessmq/internal/protocol"
 )
 
 func main() {
@@ -17,10 +17,38 @@ func main() {
 
 	log.Println("connected to MessLessMQ")
 
-	err = network.WriteFrame(conn, []byte("PING"))
+	request := protocol.Request{
+		APIKey:        protocol.APICONSUME,
+		APIVersion:    1,
+		CorrelationID: 1,
+		Payload:       []byte("test"),
+	}
+
+	frame, err := protocol.EncodeRequest(request)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	log.Println("sent: PING")
+	if err := network.WriteFrame(conn, frame); err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("sent CONSUME request")
+
+	responseFrame, err := network.ReadFrame(conn)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	response, err := protocol.DecodeResponse(responseFrame)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf(
+		"received response: correlation=%d error=%d payload=%q\n",
+		response.CorrelationID,
+		response.ErrorCode,
+		response.Payload,
+	)
 }
