@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/ARIN00-web/messlessmq/internal/broker"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
@@ -16,9 +17,16 @@ func HandleConnection(conn net.Conn, dispatcher *broker.Dispatcher) {
 	log.Println("client connected:", conn.RemoteAddr())
 
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+			log.Println("failed to set read deadline:", err)
+			return
+		}
+
 		if err := handleRequest(conn, dispatcher); err != nil {
 			if errors.Is(err, io.EOF) {
 				log.Println("client disconnected:", conn.RemoteAddr())
+			} else if isTimeoutError(err) {
+				log.Println("client timed out:", conn.RemoteAddr())
 			} else {
 				log.Println("connection error:", err)
 			}
@@ -58,6 +66,10 @@ func handleRequest(conn net.Conn, dispatcher *broker.Dispatcher) error {
 		return err
 	}
 
+	if err := conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return err
+	}
+
 	return WriteFrame(conn, responseFrame)
 }
 
@@ -71,4 +83,14 @@ func errorCodeFromError(err error) uint16 {
 	}
 
 	return protocol.ErrorInternal
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+
+	return false
 }
