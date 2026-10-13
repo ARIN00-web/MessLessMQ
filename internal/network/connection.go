@@ -11,12 +11,24 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 )
 
-func HandleConnection(conn net.Conn, dispatcher *broker.Dispatcher) {
+func HandleConnection(
+	conn net.Conn,
+	dispatcher *broker.Dispatcher,
+	shutdown <-chan struct{},
+) {
 	defer conn.Close()
 
 	log.Println("client connected:", conn.RemoteAddr())
 
 	for {
+		// Do not begin another request after shutdown starts.
+		select {
+		case <-shutdown:
+			log.Println("stopping connection:", conn.RemoteAddr())
+			return
+		default:
+		}
+
 		if err := conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
 			log.Println("failed to set read deadline:", err)
 			return
