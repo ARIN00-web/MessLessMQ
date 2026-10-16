@@ -94,6 +94,18 @@ func errorCodeFromError(err error) uint16 {
 		return protocol.ErrorUnknownAPI
 	}
 
+	if errors.Is(err, protocol.ErrInvalidAckMode) {
+		return protocol.ErrorInvalidAckMode
+	}
+
+	if errors.Is(err, protocol.ErrMessageTooLarge) {
+		return protocol.ErrorMessageTooLarge
+	}
+
+	if errors.Is(err, protocol.ErrInvalidRequest) {
+		return protocol.ErrorInvalidRequest
+	}
+
 	return protocol.ErrorInternal
 }
 

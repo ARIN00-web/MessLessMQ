@@ -62,3 +62,41 @@ func TestErrorCodeFromWrappedUnknownAPI(t *testing.T) {
 		)
 	}
 }
+
+func TestProducerErrorCodeMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want uint16
+	}{
+		{
+			name: "invalid acknowledgement mode",
+			err:  protocol.ErrInvalidAckMode,
+			want: protocol.ErrorInvalidAckMode,
+		},
+		{
+			name: "message too large",
+			err:  protocol.ErrMessageTooLarge,
+			want: protocol.ErrorMessageTooLarge,
+		},
+		{
+			name: "invalid request",
+			err:  protocol.ErrInvalidRequest,
+			want: protocol.ErrorInvalidRequest,
+		},
+		{
+			name: "unexpected error",
+			err:  errors.New("unexpected failure"),
+			want: protocol.ErrorInternal,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := errorCodeFromError(tt.err)
+			if got != tt.want {
+				t.Fatalf("got error code %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

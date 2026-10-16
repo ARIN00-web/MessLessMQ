@@ -2,7 +2,6 @@ package protocol
 
 import "fmt"
 
-// AckMode specifies the producer's requested acknowledgement policy.
 type AckMode int16
 
 const (
@@ -16,7 +15,7 @@ func (a AckMode) Validate() error {
 	case AckNone, AckLeader, AckAll:
 		return nil
 	default:
-		return fmt.Errorf("invalid acknowledgement mode: %d", a)
+		return fmt.Errorf("%w: %d", ErrInvalidAckMode, a)
 	}
 }
 

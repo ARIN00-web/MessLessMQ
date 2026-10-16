@@ -6,73 +6,78 @@ import (
 )
 
 const (
-	batchHeaderSize = 4
-	batchItemHeader = 4
+	batchHeaderSize  = 4
+	batchMessageSize = 4
 
 	MaxBatchMessages = 1000
 	MaxBatchSize     = 10 * 1024 * 1024 // 10 MiB
 )
 
-// EncodeBatch encodes an ordered batch of messages.
+// EncodeBatch serializes a batch of messages.
+//
+// Wire format:
+//
+//	[MessageCount: 4 bytes]
+//	Repeated for each message:
+//	    [MessageLength: 4 bytes]
+//	    [EncodedMessage: MessageLength bytes]
+//
+// All integer fields use big-endian byte order.
+// Encoding fails if any message is invalid or the batch exceeds its limits.
 func EncodeBatch(batch MessageBatch) ([]byte, error) {
-	count := len(batch.Messages)
+	messageCount := len(batch.Messages)
 
-	if count == 0 {
-		return nil, fmt.Errorf("batch must contain at least one message")
+	if messageCount == 0 {
+		return nil, fmt.Errorf(
+			"%w: batch cannot be empty",
+			ErrInvalidRequest,
+		)
 	}
 
-	if count > MaxBatchMessages {
-		return nil, fmt.Errorf("batch exceeds maximum message count")
+	if messageCount > MaxBatchMessages {
+		return nil, fmt.Errorf(
+			"%w: batch contains %d messages; maximum is %d",
+			ErrMessageTooLarge,
+			messageCount,
+			MaxBatchMessages,
+		)
 	}
 
-	// Validate the total size before encoding individual messages.
+	encodedMessages := make([][]byte, 0, messageCount)
 	totalSize := batchHeaderSize
 
-	for _, msg := range batch.Messages {
-		if msg.Topic == "" {
-			return nil, fmt.Errorf("topic cannot be empty")
+	for i, msg := range batch.Messages {
+		encoded, err := EncodeMessage(msg)
+		if err != nil {
+			return nil, fmt.Errorf("encode message %d: %w", i, err)
 		}
 
-		if len(msg.Topic) > maxTopicSize {
-			return nil, fmt.Errorf("topic is too large")
+		// Check the size before adding it to prevent an oversized batch.
+		if len(encoded) > MaxBatchSize ||
+			totalSize > MaxBatchSize-batchMessageSize-len(encoded) {
+			return nil, fmt.Errorf(
+				"%w: batch exceeds maximum size of %d bytes",
+				ErrMessageTooLarge,
+				MaxBatchSize,
+			)
 		}
 
-		if len(msg.Key) > maxKeySize {
-			return nil, fmt.Errorf("key is too large")
-		}
-
-		messageSize := messageHeaderSize +
-			len(msg.Topic) +
-			len(msg.Key) +
-			len(msg.Value)
-
-		if messageSize > MaxMessageSize {
-			return nil, fmt.Errorf("message exceeds maximum size")
-		}
-
-		totalSize += batchItemHeader + messageSize
-
-		if totalSize > MaxBatchSize {
-			return nil, fmt.Errorf("batch exceeds maximum size")
-		}
+		encodedMessages = append(encodedMessages, encoded)
+		totalSize += batchMessageSize + len(encoded)
 	}
 
 	data := make([]byte, totalSize)
-	binary.BigEndian.PutUint32(data[0:4], uint32(count))
+
+	binary.BigEndian.PutUint32(data[0:4], uint32(messageCount))
 
 	offset := batchHeaderSize
 
-	for _, msg := range batch.Messages {
-		encoded, err := EncodeMessage(msg)
-		if err != nil {
-			return nil, fmt.Errorf("encode batch message: %w", err)
-		}
-
+	for _, encoded := range encodedMessages {
 		binary.BigEndian.PutUint32(
-			data[offset:offset+batchItemHeader],
+			data[offset:offset+batchMessageSize],
 			uint32(len(encoded)),
 		)
-		offset += batchItemHeader
+		offset += batchMessageSize
 
 		copy(data[offset:], encoded)
 		offset += len(encoded)
@@ -81,71 +86,111 @@ func EncodeBatch(batch MessageBatch) ([]byte, error) {
 	return data, nil
 }
 
-// DecodeBatch decodes a complete batch or returns an error.
+// DecodeBatch deserializes a batch and validates its structure.
+//
+// It rejects malformed batches instead of returning a partially decoded batch.
 func DecodeBatch(data []byte) (MessageBatch, error) {
 	if len(data) < batchHeaderSize {
-		return MessageBatch{}, fmt.Errorf("batch header is incomplete")
+		return MessageBatch{}, fmt.Errorf(
+			"%w: batch header is incomplete",
+			ErrInvalidRequest,
+		)
 	}
 
 	if len(data) > MaxBatchSize {
-		return MessageBatch{}, fmt.Errorf("batch exceeds maximum size")
+		return MessageBatch{}, fmt.Errorf(
+			"%w: batch exceeds maximum size of %d bytes",
+			ErrMessageTooLarge,
+			MaxBatchSize,
+		)
 	}
 
-	count := binary.BigEndian.Uint32(data[0:4])
+	messageCount := binary.BigEndian.Uint32(data[0:4])
 
-	if count == 0 {
-		return MessageBatch{}, fmt.Errorf("batch must contain at least one message")
+	if messageCount == 0 {
+		return MessageBatch{}, fmt.Errorf(
+			"%w: batch cannot be empty",
+			ErrInvalidRequest,
+		)
 	}
 
-	if count > MaxBatchMessages {
-		return MessageBatch{}, fmt.Errorf("batch exceeds maximum message count")
+	if messageCount > MaxBatchMessages {
+		return MessageBatch{}, fmt.Errorf(
+			"%w: batch contains %d messages; maximum is %d",
+			ErrMessageTooLarge,
+			messageCount,
+			MaxBatchMessages,
+		)
 	}
 
-	messages := make([]Message, 0, int(count))
+	// Every message requires at least its 4-byte length prefix.
+	// Reject impossible counts before allocating the message slice.
+	remaining := len(data) - batchHeaderSize
+	if uint64(messageCount)*uint64(batchMessageSize) > uint64(remaining) {
+		return MessageBatch{}, fmt.Errorf(
+			"%w: batch declares %d messages but lacks their length prefixes",
+			ErrInvalidRequest,
+			messageCount,
+		)
+	}
+
+	messages := make([]Message, 0, int(messageCount))
 	offset := batchHeaderSize
 
-	for i := uint32(0); i < count; i++ {
-		if len(data)-offset < batchItemHeader {
+	for i := uint32(0); i < messageCount; i++ {
+		if len(data)-offset < batchMessageSize {
 			return MessageBatch{}, fmt.Errorf(
-				"batch message %d has an incomplete length header", i,
+				"%w: message %d length prefix is incomplete",
+				ErrInvalidRequest,
+				i,
 			)
 		}
 
 		messageLength := binary.BigEndian.Uint32(
-			data[offset : offset+batchItemHeader],
+			data[offset : offset+batchMessageSize],
 		)
-		offset += batchItemHeader
+		offset += batchMessageSize
 
-		remaining := len(data) - offset
+		remaining = len(data) - offset
 
-		if messageLength > uint32(remaining) {
+		if uint64(messageLength) > uint64(remaining) {
 			return MessageBatch{}, fmt.Errorf(
-				"batch message %d exceeds remaining data", i,
+				"%w: message %d declares %d bytes but only %d remain",
+				ErrInvalidRequest,
+				i,
+				messageLength,
+				remaining,
 			)
 		}
 
-		if messageLength > MaxMessageSize {
+		if messageLength > MaxBatchSize {
 			return MessageBatch{}, fmt.Errorf(
-				"batch message %d exceeds maximum message size", i,
+				"%w: message %d exceeds maximum batch size",
+				ErrMessageTooLarge,
+				i,
 			)
 		}
 
-		end := offset + int(messageLength)
+		messageEnd := offset + int(messageLength)
+		messageData := data[offset:messageEnd]
 
-		msg, err := DecodeMessage(data[offset:end])
+		msg, err := DecodeMessage(messageData)
 		if err != nil {
 			return MessageBatch{}, fmt.Errorf(
-				"decode batch message %d: %w", i, err,
+				"decode message %d: %w",
+				i,
+				err,
 			)
 		}
 
 		messages = append(messages, msg)
-		offset = end
+		offset = messageEnd
 	}
 
 	if offset != len(data) {
 		return MessageBatch{}, fmt.Errorf(
-			"batch contains %d unexpected trailing bytes",
+			"%w: batch contains %d unexpected trailing bytes",
+			ErrInvalidRequest,
 			len(data)-offset,
 		)
 	}
