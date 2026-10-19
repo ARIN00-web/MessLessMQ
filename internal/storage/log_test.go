@@ -11,9 +11,7 @@ import (
 )
 
 func TestAppendAndRead(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "messages.log")
-
-	log, err := OpenLog(path)
+	log, err := OpenLog(filepath.Join(t.TempDir(), "messages"))
 	if err != nil {
 		t.Fatalf("OpenLog() error: %v", err)
 	}
@@ -30,7 +28,6 @@ func TestAppendAndRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Append() error: %v", err)
 		}
-
 		if offset != uint64(i) {
 			t.Fatalf("offset = %d, want %d", offset, i)
 		}
@@ -45,7 +42,6 @@ func TestAppendAndRead(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Read(%d) error: %v", i, err)
 		}
-
 		if !bytes.Equal(got, want) {
 			t.Errorf("Read(%d) = %q, want %q", i, got, want)
 		}
@@ -53,7 +49,7 @@ func TestAppendAndRead(t *testing.T) {
 }
 
 func TestReadUnknownOffset(t *testing.T) {
-	log, err := OpenLog(filepath.Join(t.TempDir(), "messages.log"))
+	log, err := OpenLog(filepath.Join(t.TempDir(), "messages"))
 	if err != nil {
 		t.Fatalf("OpenLog() error: %v", err)
 	}
@@ -66,7 +62,7 @@ func TestReadUnknownOffset(t *testing.T) {
 }
 
 func TestReopenPreservesRecordsAndOffsets(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "messages.log")
+	path := filepath.Join(t.TempDir(), "messages")
 
 	log, err := OpenLog(path)
 	if err != nil {
@@ -100,14 +96,13 @@ func TestReopenPreservesRecordsAndOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Append() after reopen error: %v", err)
 	}
-
 	if nextOffset != 1 {
 		t.Fatalf("next offset = %d, want 1", nextOffset)
 	}
 }
 
 func TestConcurrentAppends(t *testing.T) {
-	log, err := OpenLog(filepath.Join(t.TempDir(), "messages.log"))
+	log, err := OpenLog(filepath.Join(t.TempDir(), "messages"))
 	if err != nil {
 		t.Fatalf("OpenLog() error: %v", err)
 	}
@@ -128,7 +123,6 @@ func TestConcurrentAppends(t *testing.T) {
 
 			for message := 0; message < messagesPerWriter; message++ {
 				data := fmt.Appendf(nil, "writer-%d-message-%d", writer, message)
-
 				if _, err := log.Append(data); err != nil {
 					errs <- err
 				}
@@ -155,15 +149,120 @@ func TestConcurrentAppends(t *testing.T) {
 }
 
 func TestRejectsIncompleteRecordHeader(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "messages.log")
+	path := filepath.Join(t.TempDir(), "messages")
+	if err := os.MkdirAll(path, 0755); err != nil {
+		t.Fatalf("MkdirAll() error: %v", err)
+	}
 
-	// Simulate an incomplete record header.
-	if err := os.WriteFile(path, []byte{0, 0}, 0644); err != nil {
+	segmentPath := filepath.Join(path, segmentFilename(0))
+	if err := os.WriteFile(segmentPath, []byte{0, 0}, 0644); err != nil {
 		t.Fatalf("WriteFile() error: %v", err)
 	}
 
 	_, err := OpenLog(path)
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
+	}
+}
+
+func TestSegmentRollover(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages")
+
+	// Each record uses 4 bytes of header plus 6 bytes of payload.
+	log, err := OpenLogWithSegmentSize(path, 10)
+	if err != nil {
+		t.Fatalf("OpenLogWithSegmentSize() error: %v", err)
+	}
+
+	messages := [][]byte{
+		[]byte("first!"),
+		[]byte("second"),
+		[]byte("third!"),
+	}
+
+	for i, message := range messages {
+		offset, err := log.Append(message)
+		if err != nil {
+			t.Fatalf("Append() error: %v", err)
+		}
+		if offset != uint64(i) {
+			t.Fatalf("offset = %d, want %d", offset, i)
+		}
+	}
+
+	if len(log.segments) < 2 {
+		t.Fatalf("expected segment rollover, got %d segment(s)", len(log.segments))
+	}
+
+	for i, want := range messages {
+		got, err := log.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) error: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("Read(%d) = %q, want %q", i, got, want)
+		}
+	}
+
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	log, err = OpenLogWithSegmentSize(path, 10)
+	if err != nil {
+		t.Fatalf("reopen segmented log: %v", err)
+	}
+	defer log.Close()
+
+	if got := log.NextOffset(); got != uint64(len(messages)) {
+		t.Fatalf("NextOffset() after reopen = %d, want %d", got, len(messages))
+	}
+
+	for i, want := range messages {
+		got, err := log.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("Read(%d) after reopen error: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("Read(%d) after reopen = %q, want %q", i, got, want)
+		}
+	}
+}
+
+func TestSegmentFilesUseBaseOffsets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "messages")
+
+	log, err := OpenLogWithSegmentSize(path, 10)
+	if err != nil {
+		t.Fatalf("OpenLogWithSegmentSize() error: %v", err)
+	}
+
+	for _, message := range [][]byte{
+		[]byte("first!"),
+		[]byte("second"),
+		[]byte("third!"),
+	} {
+		if _, err := log.Append(message); err != nil {
+			t.Fatalf("Append() error: %v", err)
+		}
+	}
+
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatalf("ReadDir() error: %v", err)
+	}
+
+	if len(entries) < 2 {
+		t.Fatalf("expected multiple segment files, got %d", len(entries))
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+			t.Errorf("unexpected segment entry: %s", entry.Name())
+		}
 	}
 }
