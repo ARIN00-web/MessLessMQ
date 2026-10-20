@@ -168,7 +168,7 @@ func TestRejectsIncompleteRecordHeader(t *testing.T) {
 func TestSegmentRollover(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages")
 
-	// Each record uses 4 bytes of header plus 6 bytes of payload.
+	// Each record has a 12-byte header plus its payload.
 	log, err := OpenLogWithSegmentSize(path, 10)
 	if err != nil {
 		t.Fatalf("OpenLogWithSegmentSize() error: %v", err)
@@ -256,13 +256,37 @@ func TestSegmentFilesUseBaseOffsets(t *testing.T) {
 		t.Fatalf("ReadDir() error: %v", err)
 	}
 
-	if len(entries) < 2 {
-		t.Fatalf("expected multiple segment files, got %d", len(entries))
-	}
+	logFiles := 0
+	indexFiles := 0
+	timeIndexFiles := 0
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+		if entry.IsDir() {
+			t.Errorf("unexpected directory: %s", entry.Name())
+			continue
+		}
+
+		switch filepath.Ext(entry.Name()) {
+		case ".log":
+			logFiles++
+		case ".index":
+			indexFiles++
+		case ".timeindex":
+			timeIndexFiles++
+		default:
 			t.Errorf("unexpected segment entry: %s", entry.Name())
 		}
+	}
+
+	if logFiles != 3 {
+		t.Errorf("log files = %d, want 3", logFiles)
+	}
+
+	if indexFiles != 3 {
+		t.Errorf("index files = %d, want 3", indexFiles)
+	}
+
+	if timeIndexFiles != 3 {
+		t.Errorf("time index files = %d, want 3", timeIndexFiles)
 	}
 }

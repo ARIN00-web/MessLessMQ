@@ -9,39 +9,51 @@ import (
 
 func TestEncodeDecodeRecord(t *testing.T) {
 	payload := []byte("MessLessMQ message")
+	timestamp := int64(1_797_000_000_123)
 
-	encoded, err := EncodeRecord(payload)
+	encoded, err := EncodeRecordAt(payload, timestamp)
 	if err != nil {
-		t.Fatalf("EncodeRecord() error: %v", err)
+		t.Fatal(err)
 	}
 
-	if got := binary.BigEndian.Uint32(encoded[:RecordHeaderSize]); got != uint32(len(payload)) {
+	if got := binary.BigEndian.Uint32(encoded[:RecordLengthSize]); got != uint32(len(payload)) {
 		t.Fatalf("encoded length = %d, want %d", got, len(payload))
 	}
 
-	decoded, err := DecodeRecord(encoded)
+	decoded, gotTimestamp, err := DecodeRecordWithTimestamp(encoded)
 	if err != nil {
-		t.Fatalf("DecodeRecord() error: %v", err)
+		t.Fatal(err)
 	}
 
 	if !bytes.Equal(decoded, payload) {
-		t.Fatalf("decoded payload = %q, want %q", decoded, payload)
+		t.Fatalf("payload = %q, want %q", decoded, payload)
+	}
+	if gotTimestamp != timestamp {
+		t.Fatalf("timestamp = %d, want %d", gotTimestamp, timestamp)
+	}
+
+	// The original decoding API remains compatible.
+	decoded, err = DecodeRecord(encoded)
+	if err != nil || !bytes.Equal(decoded, payload) {
+		t.Fatalf("DecodeRecord() = %q, error = %v", decoded, err)
 	}
 }
 
 func TestRecordSupportsEmptyPayload(t *testing.T) {
-	encoded, err := EncodeRecord(nil)
+	encoded, err := EncodeRecordAt(nil, 1234)
 	if err != nil {
-		t.Fatalf("EncodeRecord() error: %v", err)
+		t.Fatal(err)
 	}
 
-	decoded, err := DecodeRecord(encoded)
+	payload, timestamp, err := DecodeRecordWithTimestamp(encoded)
 	if err != nil {
-		t.Fatalf("DecodeRecord() error: %v", err)
+		t.Fatal(err)
 	}
-
-	if len(decoded) != 0 {
-		t.Fatalf("decoded payload length = %d, want 0", len(decoded))
+	if len(payload) != 0 {
+		t.Fatalf("payload length = %d, want 0", len(payload))
+	}
+	if timestamp != 1234 {
+		t.Fatalf("timestamp = %d, want 1234", timestamp)
 	}
 }
 
@@ -53,10 +65,13 @@ func TestDecodeRecordRejectsIncompleteHeader(t *testing.T) {
 }
 
 func TestDecodeRecordRejectsLengthMismatch(t *testing.T) {
-	// Header declares 5 payload bytes, but only 2 are present.
-	record := []byte{0, 0, 0, 5, 'h', 'i'}
+	record, err := EncodeRecordAt([]byte("hi"), 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record = append(record, 'x')
 
-	_, err := DecodeRecord(record)
+	_, err = DecodeRecord(record)
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}
@@ -64,7 +79,7 @@ func TestDecodeRecordRejectsLengthMismatch(t *testing.T) {
 
 func TestDecodeRecordRejectsOversizedPayload(t *testing.T) {
 	record := make([]byte, RecordHeaderSize)
-	binary.BigEndian.PutUint32(record, uint32(MaxRecordSize+1))
+	binary.BigEndian.PutUint32(record[:RecordLengthSize], uint32(MaxRecordSize+1))
 
 	_, err := DecodeRecord(record)
 	if !errors.Is(err, ErrInvalidRecord) {
@@ -73,9 +88,7 @@ func TestDecodeRecordRejectsOversizedPayload(t *testing.T) {
 }
 
 func TestEncodeRecordRejectsOversizedPayload(t *testing.T) {
-	payload := make([]byte, MaxRecordSize+1)
-
-	_, err := EncodeRecord(payload)
+	_, err := EncodeRecord(make([]byte, MaxRecordSize+1))
 	if !errors.Is(err, ErrInvalidRecord) {
 		t.Fatalf("expected ErrInvalidRecord, got %v", err)
 	}

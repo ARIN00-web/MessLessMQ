@@ -3,79 +3,75 @@ package storage
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 )
 
 const (
-	// RecordHeaderSize is the size of the payload-length prefix.
-	RecordHeaderSize = 4
-
-	// MaxRecordSize is the maximum size of one record's payload.
-	MaxRecordSize = 10 * 1024 * 1024 // 10 MiB
+	RecordLengthSize    = 4
+	RecordTimestampSize = 8
+	RecordHeaderSize    = RecordLengthSize + RecordTimestampSize
+	MaxRecordSize       = 10 * 1024 * 1024
 )
 
-// EncodeRecord encodes a payload as a length-prefixed storage record.
-//
-// Format:
-//
-//	[Payload length: 4 bytes, big-endian]
-//	[Payload: variable length]
+// EncodeRecord preserves the existing API and assigns the current timestamp.
 func EncodeRecord(payload []byte) ([]byte, error) {
+	return EncodeRecordAt(payload, time.Now().UnixMilli())
+}
+
+// EncodeRecordAt encodes a payload with an explicit Unix-millisecond timestamp.
+func EncodeRecordAt(payload []byte, timestamp int64) ([]byte, error) {
 	if len(payload) > MaxRecordSize {
 		return nil, fmt.Errorf(
 			"%w: payload size %d exceeds maximum %d",
-			ErrInvalidRecord,
-			len(payload),
-			MaxRecordSize,
+			ErrInvalidRecord, len(payload), MaxRecordSize,
 		)
 	}
 
 	record := make([]byte, RecordHeaderSize+len(payload))
-
-	binary.BigEndian.PutUint32(
-		record[:RecordHeaderSize],
-		uint32(len(payload)),
+	binary.BigEndian.PutUint32(record[:RecordLengthSize], uint32(len(payload)))
+	binary.BigEndian.PutUint64(
+		record[RecordLengthSize:RecordHeaderSize],
+		uint64(timestamp),
 	)
-
 	copy(record[RecordHeaderSize:], payload)
 
 	return record, nil
 }
 
-// DecodeRecord validates and decodes exactly one complete storage record.
+// DecodeRecord returns the payload, preserving the existing API.
 func DecodeRecord(record []byte) ([]byte, error) {
+	payload, _, err := DecodeRecordWithTimestamp(record)
+	return payload, err
+}
+
+// DecodeRecordWithTimestamp validates a record and returns its payload and timestamp.
+func DecodeRecordWithTimestamp(record []byte) ([]byte, int64, error) {
 	if len(record) < RecordHeaderSize {
-		return nil, fmt.Errorf(
-			"%w: incomplete record header",
-			ErrInvalidRecord,
-		)
+		return nil, 0, fmt.Errorf("%w: incomplete record header", ErrInvalidRecord)
 	}
 
-	payloadLength := binary.BigEndian.Uint32(
-		record[:RecordHeaderSize],
-	)
-
+	payloadLength := binary.BigEndian.Uint32(record[:RecordLengthSize])
 	if payloadLength > uint32(MaxRecordSize) {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"%w: payload size %d exceeds maximum %d",
-			ErrInvalidRecord,
-			payloadLength,
-			MaxRecordSize,
+			ErrInvalidRecord, payloadLength, MaxRecordSize,
 		)
 	}
 
 	actualLength := len(record) - RecordHeaderSize
-
 	if uint64(payloadLength) != uint64(actualLength) {
-		return nil, fmt.Errorf(
+		return nil, 0, fmt.Errorf(
 			"%w: declared payload length %d, actual length %d",
-			ErrInvalidRecord,
-			payloadLength,
-			actualLength,
+			ErrInvalidRecord, payloadLength, actualLength,
 		)
 	}
+
+	timestamp := int64(binary.BigEndian.Uint64(
+		record[RecordLengthSize:RecordHeaderSize],
+	))
 
 	payload := make([]byte, actualLength)
 	copy(payload, record[RecordHeaderSize:])
 
-	return payload, nil
+	return payload, timestamp, nil
 }
