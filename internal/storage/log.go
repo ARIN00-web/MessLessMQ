@@ -121,25 +121,51 @@ func (l *Log) loadSegments() error {
 		base uint64
 		path string
 	}
+
 	var files []fileInfo
 
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
 			continue
 		}
+
 		var base uint64
 		if _, err := fmt.Sscanf(entry.Name(), "%020d.log", &base); err != nil ||
 			entry.Name() != segmentFilename(base) {
-			return fmt.Errorf("%w: invalid segment filename %q", ErrInvalidSegment, entry.Name())
+			return fmt.Errorf(
+				"%w: invalid segment filename %q",
+				ErrInvalidSegment,
+				entry.Name(),
+			)
 		}
-		files = append(files, fileInfo{base, filepath.Join(l.dir, entry.Name())})
+
+		files = append(files, fileInfo{
+			base: base,
+			path: filepath.Join(l.dir, entry.Name()),
+		})
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].base < files[j].base })
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].base < files[j].base
+	})
 
 	var expected uint64
-	for _, sf := range files {
+
+	for i, sf := range files {
+		// Retention may have removed the oldest segments, so the first
+		// remaining segment is allowed to start at a non-zero offset.
+		if i == 0 {
+			expected = sf.base
+		}
+
+		// Still reject gaps between the surviving segments.
 		if sf.base != expected {
-			return fmt.Errorf("%w: segment starts at %d, expected %d", ErrInvalidSegment, sf.base, expected)
+			return fmt.Errorf(
+				"%w: segment starts at %d, expected %d",
+				ErrInvalidSegment,
+				sf.base,
+				expected,
+			)
 		}
 
 		f, err := os.OpenFile(sf.path, os.O_RDWR, 0644)
@@ -148,13 +174,19 @@ func (l *Log) loadSegments() error {
 		}
 
 		openSidecar := func(name string) (*os.File, error) {
-			return os.OpenFile(filepath.Join(l.dir, name), os.O_CREATE|os.O_RDWR, 0644)
+			return os.OpenFile(
+				filepath.Join(l.dir, name),
+				os.O_CREATE|os.O_RDWR,
+				0644,
+			)
 		}
+
 		idx, err := openSidecar(segmentIndexFilename(sf.base))
 		if err != nil {
 			f.Close()
 			return err
 		}
+
 		tidx, err := openSidecar(segmentTimeIndexFilename(sf.base))
 		if err != nil {
 			f.Close()
@@ -169,12 +201,14 @@ func (l *Log) loadSegments() error {
 			timeIndexFile: tidx,
 			path:          sf.path,
 		}
+
 		if err := scanSegment(seg); err != nil {
 			f.Close()
 			idx.Close()
 			tidx.Close()
 			return fmt.Errorf("scan segment %s: %w", sf.path, err)
 		}
+
 		if err := rebuildIndexes(seg); err != nil {
 			f.Close()
 			idx.Close()
@@ -185,6 +219,7 @@ func (l *Log) loadSegments() error {
 		expected = seg.baseOffset + uint64(len(seg.positions))
 		l.segments = append(l.segments, seg)
 	}
+
 	l.nextOffset = expected
 	return nil
 }
