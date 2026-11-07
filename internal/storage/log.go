@@ -201,6 +201,18 @@ func (l *Log) loadSegments() error {
 			timeIndexFile: tidx,
 			path:          sf.path,
 		}
+		if i == len(files)-1 {
+			if _, err := recoverSegmentTail(seg.file); err != nil {
+				f.Close()
+				idx.Close()
+				tidx.Close()
+				return fmt.Errorf(
+					"recover active segment %s: %w",
+					sf.path,
+					err,
+				)
+			}
+		}
 
 		if err := scanSegment(seg); err != nil {
 			f.Close()

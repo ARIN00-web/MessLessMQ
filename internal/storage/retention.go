@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var removeFile = os.Remove
+
 // RetentionConfig controls when old log segments can be removed.
 //
 // A zero value disables that retention policy:
@@ -238,11 +240,11 @@ func deleteSegmentFiles(seg *segment) error {
 }
 
 func removeIfExists(path string) error {
-	err := os.Remove(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	err := removeFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 // closeSegmentFiles closes any currently open segment handles and clears the

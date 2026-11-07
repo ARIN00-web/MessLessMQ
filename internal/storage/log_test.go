@@ -148,7 +148,8 @@ func TestConcurrentAppends(t *testing.T) {
 	}
 }
 
-func TestRejectsIncompleteRecordHeader(t *testing.T) {
+
+func TestRecoversIncompleteRecordHeader(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages")
 	if err := os.MkdirAll(path, 0755); err != nil {
 		t.Fatalf("MkdirAll() error: %v", err)
@@ -159,11 +160,26 @@ func TestRejectsIncompleteRecordHeader(t *testing.T) {
 		t.Fatalf("WriteFile() error: %v", err)
 	}
 
-	_, err := OpenLog(path)
-	if !errors.Is(err, ErrInvalidRecord) {
-		t.Fatalf("expected ErrInvalidRecord, got %v", err)
+	log, err := OpenLog(path)
+	if err != nil {
+		t.Fatalf("OpenLog() should recover an incomplete trailing header: %v", err)
+	}
+	defer log.Close()
+
+	if got := log.NextOffset(); got != 0 {
+		t.Fatalf("NextOffset() = %d, want 0", got)
+	}
+
+	info, err := os.Stat(segmentPath)
+	if err != nil {
+		t.Fatalf("Stat() error: %v", err)
+	}
+
+	if info.Size() != 0 {
+		t.Fatalf("recovered segment size = %d, want 0", info.Size())
 	}
 }
+
 
 func TestSegmentRollover(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages")
