@@ -218,3 +218,55 @@ func (c *Cluster) Statuses() map[string]NodeStatus {
 	}
 	return out
 }
+
+// SyncFollower sends the current leader's committed log to one available
+// follower. It is used when a controller process becomes reachable again.
+// The operation is transport-neutral and deterministic, like the rest of this
+// package's in-memory cluster harness.
+func (c *Cluster) SyncFollower(followerID string) error {
+	if c == nil {
+		return ErrInvalidConfig
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	follower, exists := c.nodes[followerID]
+	if !exists {
+		return ErrUnknownNode
+	}
+	if !c.available[followerID] {
+		return ErrNodeUnavailable
+	}
+	if c.leaderID == "" {
+		return ErrNotLeader
+	}
+	if followerID == c.leaderID {
+		return nil
+	}
+	leader := c.nodes[c.leaderID]
+	if leader == nil || !c.available[c.leaderID] || leader.Status().Role != RoleLeader {
+		c.leaderID = ""
+		return ErrNotLeader
+	}
+	if !c.canCommunicateLocked(c.leaderID, followerID) {
+		return ErrNoQuorum
+	}
+
+	request := leader.appendRequest()
+	response := follower.HandleAppendEntries(request)
+	leaderStatus := leader.Status()
+	if response.Term > leaderStatus.Term {
+		c.leaderID = ""
+		return ErrNotLeader
+	}
+	if !response.Success {
+		return ErrLogInvariant
+	}
+	followerStatus := follower.Status()
+	if followerStatus.LastLogIndex != leaderStatus.LastLogIndex ||
+		followerStatus.CommitIndex < leaderStatus.CommitIndex ||
+		followerStatus.AppliedIndex < leaderStatus.AppliedIndex {
+		return ErrLogInvariant
+	}
+	return nil
+}

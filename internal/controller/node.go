@@ -240,6 +240,17 @@ func (n *Node) HandleAppendEntries(request AppendEntriesRequest) AppendEntriesRe
 		n.log = append(n.log, cloneEntries([]LogEntry{incoming})[0])
 	}
 
+	// A follower may have an uncommitted suffix beyond the leader's log.
+	// Once the leader's prefix matches, discard that stale suffix. A committed
+	// suffix is never truncated because it would violate Raft safety.
+	matchedEnd := request.PreviousLogIndex + uint64(len(request.Entries))
+	if matchedEnd < uint64(len(n.log)) {
+		if matchedEnd < n.commitIndex {
+			return response
+		}
+		n.log = n.log[:matchedEnd]
+	}
+
 	if request.LeaderCommitIndex > n.commitIndex {
 		newCommit := request.LeaderCommitIndex
 		if newCommit > uint64(len(n.log)) {
