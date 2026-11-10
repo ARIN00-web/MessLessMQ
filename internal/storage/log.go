@@ -517,6 +517,35 @@ func (l *Log) NextOffset() uint64 {
 	return l.nextOffset
 }
 
+func (l *Log) StartOffset() (uint64, error) {
+    l.mu.RLock()
+    defer l.mu.RUnlock()
+
+    if l.closed {
+        return 0, os.ErrClosed
+    }
+    if len(l.segments) == 0 {
+        return l.nextOffset, nil
+    }
+    return l.segments[0].baseOffset, nil
+}
+
+// OffsetRange returns the earliest retained offset and the next offset after
+// the latest record under one read lock. This gives consumers a consistent
+// range snapshot when appends or retention may be happening concurrently.
+func (l *Log) OffsetRange() (startOffset, nextOffset uint64, err error) {
+    l.mu.RLock()
+    defer l.mu.RUnlock()
+
+    if l.closed {
+        return 0, 0, os.ErrClosed
+    }
+    if len(l.segments) == 0 {
+        return l.nextOffset, l.nextOffset, nil
+    }
+    return l.segments[0].baseOffset, l.nextOffset, nil
+}
+
 func (l *Log) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()

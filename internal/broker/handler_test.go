@@ -4,56 +4,50 @@ import (
 	"testing"
 
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
 func TestProduceHandler(t *testing.T) {
 	handler := NewProduceHandler()
-
-	req := protocol.Request{
-		APIKey:        protocol.APIPRODUCE,
-		APIVersion:    1,
-		CorrelationID: 1,
-		Payload:       []byte("test"),
-	}
-
+	req := protocol.Request{APIKey: protocol.APIPRODUCE, APIVersion: 1, CorrelationID: 1, Payload: []byte("test")}
 	response, err := handler.Handle(req)
 	if err != nil {
 		t.Fatalf("handler failed: %v", err)
 	}
-
-	expected := "PRODUCE handler not implemented"
-
-	if string(response) != expected {
-		t.Fatalf(
-			"unexpected response: got %q, want %q",
-			response,
-			expected,
-		)
+	if string(response) != "PRODUCE handler not implemented" {
+		t.Fatalf("unexpected response: %q", response)
 	}
 }
 
 func TestConsumeHandler(t *testing.T) {
-	handler := NewConsumeHandler()
-
-	req := protocol.Request{
-		APIKey:        protocol.APICONSUME,
-		APIVersion:    1,
-		CorrelationID: 2,
-		Payload:       []byte("test"),
+	registry := topic.NewRegistry()
+	testTopic, err := registry.CreateWithPartitionCount("orders", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testTopic.OpenLogs(t.TempDir(), 1024); err != nil {
+		t.Fatal(err)
+	}
+	defer testTopic.CloseLogs()
+	partition, _ := testTopic.Partition(0)
+	if _, err := partition.Append([]byte("hello")); err != nil {
+		t.Fatal(err)
 	}
 
-	response, err := handler.Handle(req)
+	payload, err := protocol.EncodeConsumeRequest(protocol.ConsumeRequest{Topic: "orders", PartitionID: 0, Offset: 0, MaxMessages: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewConsumeHandler(registry)
+	responsePayload, err := handler.Handle(protocol.Request{APIKey: protocol.APICONSUME, APIVersion: ConsumeAPIVersion, CorrelationID: 2, Payload: payload})
 	if err != nil {
 		t.Fatalf("handler failed: %v", err)
 	}
-
-	expected := "CONSUME handler not implemented"
-
-	if string(response) != expected {
-		t.Fatalf(
-			"unexpected response: got %q, want %q",
-			response,
-			expected,
-		)
+	response, err := protocol.DecodeConsumeResponse(responsePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Records) != 1 || string(response.Records[0].Value) != "hello" {
+		t.Fatalf("unexpected response: %+v", response)
 	}
 }

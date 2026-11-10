@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
 var ErrUnknownAPI = errors.New("unknown API key")
@@ -14,21 +15,29 @@ type Dispatcher struct {
 	consumeHandler Handler
 }
 
-func NewDispatcher() *Dispatcher {
+// NewDispatcher accepts the broker's shared topic registry. The variadic form
+// preserves the original no-argument constructor for callers and tests that
+// do not configure topics.
+func NewDispatcher(registries ...*topic.Registry) *Dispatcher {
+	registry := topic.NewRegistry()
+	if len(registries) > 0 && registries[0] != nil {
+		registry = registries[0]
+	}
 	return &Dispatcher{
 		produceHandler: NewProduceHandler(),
-		consumeHandler: NewConsumeHandler(),
+		consumeHandler: NewConsumeHandler(registry),
 	}
 }
 
 func (d *Dispatcher) Dispatch(req protocol.Request) ([]byte, error) {
+	if d == nil {
+		return nil, fmt.Errorf("%w: nil dispatcher", protocol.ErrInvalidRequest)
+	}
 	switch req.APIKey {
 	case protocol.APIPRODUCE:
 		return d.produceHandler.Handle(req)
-
 	case protocol.APICONSUME:
 		return d.consumeHandler.Handle(req)
-
 	default:
 		return nil, fmt.Errorf("%w: %d", ErrUnknownAPI, req.APIKey)
 	}

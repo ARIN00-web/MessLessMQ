@@ -8,7 +8,9 @@ import (
 	"time"
 
 	"github.com/ARIN00-web/messlessmq/internal/broker"
+	"github.com/ARIN00-web/messlessmq/internal/consumer"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
 func HandleConnection(
@@ -104,6 +106,24 @@ func errorCodeFromError(err error) uint16 {
 
 	if errors.Is(err, protocol.ErrInvalidRequest) {
 		return protocol.ErrorInvalidRequest
+	}
+	if errors.Is(err, protocol.ErrInvalidFetchLimit) || errors.Is(err, consumer.ErrInvalidFetchLimit) {
+		return protocol.ErrorInvalidFetchLimit
+	}
+	if errors.Is(err, protocol.ErrUnsupportedVersion) {
+		return protocol.ErrorUnsupportedVersion
+	}
+	if errors.Is(err, topic.ErrTopicNotFound) {
+		return protocol.ErrorUnknownTopic
+	}
+	if errors.Is(err, topic.ErrPartitionNotFound) {
+		return protocol.ErrorPartitionNotFound
+	}
+	if errors.Is(err, consumer.ErrOffsetBeforeStart) {
+		return protocol.ErrorOffsetBeforeStart
+	}
+	if errors.Is(err, consumer.ErrOffsetOutOfRange) {
+		return protocol.ErrorOffsetOutOfRange
 	}
 
 	return protocol.ErrorInternal

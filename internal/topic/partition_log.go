@@ -127,6 +127,35 @@ func (p *Partition) NextOffset() (uint64, error) {
 	return log.NextOffset(), nil
 }
 
+func (p *Partition) StartOffset() (uint64, error) {
+    log, err := p.storageLog()
+    if err != nil {
+        return 0, err
+    }
+    return log.StartOffset()
+}
+
+// OffsetRange returns a consistent snapshot of the retained start offset
+// and current log end offset.
+func (p *Partition) OffsetRange() (startOffset, nextOffset uint64, err error) {
+    log, err := p.storageLog()
+    if err != nil {
+        return 0, 0, err
+    }
+    return log.OffsetRange()
+}
+
+// ApplyRetention applies the storage engine's retention policy to this
+// partition's log. This is useful for testing how consumers handle retention.
+func (p *Partition) ApplyRetention(cfg storage.RetentionConfig) error {
+    log, err := p.storageLog()
+    if err != nil {
+        return err
+    }
+    return log.ApplyRetention(cfg)
+}
+
+
 // Sync synchronizes this partition's log and indexes.
 func (p *Partition) Sync() error {
 	log, err := p.storageLog()
