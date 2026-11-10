@@ -9,21 +9,26 @@ import (
 	"time"
 
 	"github.com/ARIN00-web/messlessmq/internal/consumer"
+	"github.com/ARIN00-web/messlessmq/internal/offsets"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
 var (
-	ErrNilRegistry            = errors.New("group coordinator requires a topic registry")
-	ErrInvalidGroupID         = errors.New("invalid consumer group ID")
-	ErrInvalidMemberID        = errors.New("invalid consumer member ID")
-	ErrInvalidSubscription    = errors.New("consumer group requires at least one topic subscription")
-	ErrSubscribedTopicMissing = errors.New("subscribed topic does not exist")
-	ErrGroupNotFound          = errors.New("consumer group not found")
-	ErrMemberNotFound         = errors.New("consumer group member not found")
-	ErrMemberAlreadyExists    = errors.New("consumer group member already exists")
-	ErrStaleGeneration        = errors.New("consumer group generation is stale")
-	ErrPartitionNotOwned      = errors.New("partition is not owned by this group member")
-	ErrInvalidSessionTimeout  = errors.New("session timeout must be positive")
+	ErrNilRegistry               = errors.New("group coordinator requires a topic registry")
+	ErrInvalidGroupID            = errors.New("invalid consumer group ID")
+	ErrInvalidMemberID           = errors.New("invalid consumer member ID")
+	ErrInvalidSubscription       = errors.New("consumer group requires at least one topic subscription")
+	ErrSubscribedTopicMissing    = errors.New("subscribed topic does not exist")
+	ErrGroupNotFound             = errors.New("consumer group not found")
+	ErrMemberNotFound            = errors.New("consumer group member not found")
+	ErrMemberAlreadyExists       = errors.New("consumer group member already exists")
+	ErrStaleGeneration           = errors.New("consumer group generation is stale")
+	ErrPartitionNotOwned         = errors.New("partition is not owned by this group member")
+	ErrInvalidSessionTimeout     = errors.New("session timeout must be positive")
+	ErrOffsetStoreNotConfigured  = errors.New("consumer offset store is not configured")
+	ErrCommittedOffsetOutOfRange = errors.New("committed offset is outside the retained partition range")
+	ErrCommitAheadOfPosition     = errors.New("cannot commit beyond the consumer read position")
+	ErrOffsetCommitNotOwned      = errors.New("cannot commit an offset for a partition not owned by the member")
 )
 
 const maxIdentifierLength = 128
@@ -48,24 +53,37 @@ type groupState struct {
 // Coordinator manages consumer-group membership, partition ownership,
 // generations, heartbeats, and eager rebalancing.
 //
-// It is intentionally in-memory in Phase 10. Durable group metadata and
-// committed offsets are later-phase responsibilities.
+// Group membership and assignments remain in memory. Committed offsets are
+// persisted separately in the __consumer_offsets internal log.
 type Coordinator struct {
-	mu       sync.Mutex
-	registry *topic.Registry
-	groups   map[string]*groupState
+	mu          sync.Mutex
+	registry    *topic.Registry
+	groups      map[string]*groupState
+	offsetStore *offsets.Store
 }
 
 // NewCoordinator creates a coordinator backed by the broker's shared topic
-// registry. Passing nil is rejected so all group operations use one registry.
-func NewCoordinator(registry *topic.Registry) (*Coordinator, error) {
+// registry. An optional offset store enables durable offset commits and
+// restoration. Existing callers without a store remain supported.
+func NewCoordinator(registry *topic.Registry, stores ...*offsets.Store) (*Coordinator, error) {
 	if registry == nil {
 		return nil, ErrNilRegistry
 	}
+	if len(stores) > 1 {
+		return nil, errors.New("NewCoordinator accepts at most one offset store")
+	}
+	var offsetStore *offsets.Store
+	if len(stores) == 1 {
+		if stores[0] == nil {
+			return nil, ErrOffsetStoreNotConfigured
+		}
+		offsetStore = stores[0]
+	}
 
 	return &Coordinator{
-		registry: registry,
-		groups:   make(map[string]*groupState),
+		registry:    registry,
+		groups:      make(map[string]*groupState),
+		offsetStore: offsetStore,
 	}, nil
 }
 
@@ -462,22 +480,36 @@ func (c *Coordinator) rebalanceLocked(g *groupState) error {
 			return fmt.Errorf("create consumer for member %q: %w", memberID, err)
 		}
 
-		// Preserve in-memory positions only when the same member keeps the
-		// same partition. Newly acquired partitions start at their earliest
-		// retained offset; durable group commits are Phase 11.
-		if member.reader != nil {
-			for _, partition := range partitions {
-				if !member.reader.HasPartition(partition.TopicName(), partition.ID()) {
+		// Preserve an in-memory position when the same member retains ownership.
+		// When a partition is newly assigned, restore its durable committed
+		// next offset if one exists. Without a commit, consumer.New starts at the
+		// earliest retained offset.
+		for _, partition := range partitions {
+			topicName := partition.TopicName()
+			partitionID := partition.ID()
+			retainedBySameMember := member.reader != nil && member.reader.HasPartition(topicName, partitionID)
+			if retainedBySameMember {
+				position, positionErr := member.reader.Position(topicName, partitionID)
+				if positionErr == nil {
+					if setErr := reader.SetPosition(topicName, partitionID, position); setErr == nil {
+						continue
+					}
+					// If retention invalidated the old in-memory cursor, keep the
+					// new reader's earliest-retained initial position.
 					continue
 				}
-				position, err := member.reader.Position(partition.TopicName(), partition.ID())
-				if err != nil {
-					continue
+			}
+
+			if c.offsetStore != nil {
+				key := offsets.Key{GroupID: g.id, Topic: topicName, PartitionID: partitionID}
+				commit, exists, commitErr := c.offsetStore.Get(key)
+				if commitErr != nil {
+					return fmt.Errorf("load committed offset for group %q topic %q partition %d: %w", g.id, topicName, partitionID, commitErr)
 				}
-				if err := reader.SetPosition(partition.TopicName(), partition.ID(), position); err != nil {
-					// Retention may have advanced since this member last fetched.
-					// New() already initialized the reader to the earliest retained offset.
-					continue
+				if exists {
+					if setErr := reader.SetPosition(topicName, partitionID, commit.NextOffset); setErr != nil {
+						return errors.Join(fmt.Errorf("%w: group=%q topic=%q partition=%d offset=%d", ErrCommittedOffsetOutOfRange, g.id, topicName, partitionID, commit.NextOffset), setErr)
+					}
 				}
 			}
 		}
