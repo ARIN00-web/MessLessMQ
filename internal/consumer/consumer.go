@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/ARIN00-web/messlessmq/internal/recordmeta"
 	"github.com/ARIN00-web/messlessmq/internal/storage"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
@@ -30,11 +31,14 @@ type partitionKey struct {
 // record format persists payload and timestamp; producer keys are not yet
 // stored as independent record fields.
 type Record struct {
-	Topic     string
-	Partition uint32
-	Offset    uint64
-	Timestamp int64
-	Value     []byte
+	Topic            string
+	Partition        uint32
+	Offset           uint64
+	Timestamp        int64
+	Value            []byte
+	ProducerID       string
+	ProducerEpoch    uint64
+	ProducerSequence uint64
 }
 
 // FetchResult describes one bounded read from a partition.
@@ -346,13 +350,23 @@ func fetchFromPartition(partition *topic.Partition, offset uint64, maxMessages u
 			}
 			return FetchResult{}, fmt.Errorf("read topic %q partition %d offset %d: %w", partition.TopicName(), partition.ID(), cursor, err)
 		}
-		result.Records = append(result.Records, Record{
+		producerMeta, applicationValue, isEnvelope, decodeErr := recordmeta.Decode(value)
+		if decodeErr != nil {
+			return FetchResult{}, fmt.Errorf("decode record metadata at offset %d: %w", cursor, decodeErr)
+		}
+		record := Record{
 			Topic:     partition.TopicName(),
 			Partition: partition.ID(),
 			Offset:    cursor,
 			Timestamp: timestamp,
-			Value:     value,
-		})
+			Value:     applicationValue,
+		}
+		if isEnvelope {
+			record.ProducerID = producerMeta.ProducerID
+			record.ProducerEpoch = producerMeta.Epoch
+			record.ProducerSequence = producerMeta.Sequence
+		}
+		result.Records = append(result.Records, record)
 		cursor++
 	}
 
