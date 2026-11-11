@@ -38,6 +38,18 @@ spec:
               value: "$(POD_NAME)"
             - name: MESSLESSMQ_LISTEN_ADDRESS
               value: ":9092"
+            - name: MESSLESSMQ_CLUSTER_ID
+              value: messlessmq-kubernetes
+            - name: MESSLESSMQ_PEER_LISTEN_ADDRESS
+              value: ":19093"
+            - name: MESSLESSMQ_PEER_ADVERTISE_ADDRESS
+              value: "$(POD_NAME).messlessmq-headless.messlessmq.svc.cluster.local:19093"
+            - name: MESSLESSMQ_SEEDS
+              value: "messlessmq-0@messlessmq-0.messlessmq-headless.messlessmq.svc.cluster.local:19093"
+            - name: MESSLESSMQ_PEER_JOIN_TIMEOUT
+              value: 90s
+            - name: MESSLESSMQ_ADMIN_ADDRESS
+              value: ":9093"
             - name: MESSLESSMQ_ADVERTISE_ADDRESS
               value: "$(POD_NAME).messlessmq-headless.messlessmq.svc.cluster.local:9092"
             - name: MESSLESSMQ_DATA_DIR
@@ -49,6 +61,12 @@ spec:
           ports:
             - name: client
               containerPort: 9092
+              protocol: TCP
+            - name: peer
+              containerPort: 19093
+              protocol: TCP
+            - name: admin
+              containerPort: 9093
               protocol: TCP
           volumeMounts:
             - name: data

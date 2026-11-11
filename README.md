@@ -1,8 +1,8 @@
 # MessLessMQ
 
-MessLessMQ is a from-scratch Go message broker project. The current executable composes a **persistent single-broker runtime** with a TCP binary protocol, durable topics/partitions, PRODUCE, CONSUME, and METADATA APIs, a small CLI, optional TLS/mTLS, metrics, health endpoints, request limits, and graceful shutdown.
+MessLessMQ is a from-scratch Go message broker project. The current executable composes a **persistent single-broker data path** with a TCP binary protocol, durable topics/partitions, PRODUCE, CONSUME, and METADATA APIs, a small CLI, optional TLS/mTLS, metrics, health endpoints, request limits, and graceful shutdown. An optional peer listener also supports seed-based broker membership discovery across independent processes.
 
-The repository also contains educational implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Those distributed components are not yet wired together into an autonomous multi-process cluster. The three-container and three-pod deployment examples run independent brokers with separate data volumes; they do not replicate messages or elect a shared partition leader.
+The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership discovery is now wired into the runtime, but controller consensus, remote message replication, authoritative partition placement, and leader-based client routing are not yet connected into an autonomous multi-process cluster. Seeing three brokers in a membership snapshot does **not** mean they replicate messages.
 
 See [docs/architecture-review.md](docs/architecture-review.md) for the implemented boundary and remaining distributed-runtime work.
 
@@ -70,6 +70,11 @@ The broker reads environment variables prefixed with `MESSLESSMQ_`:
 | `SHUTDOWN_TIMEOUT` | `30s` |
 | `RATE_LIMIT_PER_SECOND` | `1000` per remote IP |
 | `RATE_LIMIT_BURST` | `2000` per remote IP |
+| `CLUSTER_ID` | Optional shared cluster identity; enables peer membership when peer addresses are configured |
+| `PEER_LISTEN_ADDRESS` | Optional local TCP listener for peer membership, e.g. `:19093` |
+| `PEER_ADVERTISE_ADDRESS` | Optional reachable peer address advertised to other brokers |
+| `SEEDS` | Optional comma-separated `broker-id@host:port` seed peers |
+| `PEER_JOIN_TIMEOUT` | Maximum time to discover/join configured seeds; default `30s` |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | Optional server TLS certificate/key pair |
 | `TLS_CLIENT_CA_FILE`, `REQUIRE_CLIENT_CERT` | Optional mutual TLS client verification |
 | `ADMIN_ADDRESS` | Optional separate HTTP health/metrics listener; bind privately because it has no authentication middleware |
@@ -85,7 +90,43 @@ With `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093`, the runtime exposes:
 - `GET /diagnostics`
 - `GET /metrics`
 
-The management listener is separate from the binary client listener. Do not expose it to untrusted networks.
+The management listener is separate from the binary client listener. Do not expose it to untrusted networks. When peer membership is enabled, it also exposes `GET /cluster/members`, which returns the local broker's current membership snapshot.
+
+## Broker membership discovery (optional)
+
+To enable membership discovery, configure a shared `MESSLESSMQ_CLUSTER_ID`, a unique `MESSLESSMQ_BROKER_ID`, and both peer addresses on every broker. A seed string has the form `broker-id@peer-host:port`. The first broker can start without seeds or can list itself as its only seed; self-seeds are ignored after validating that the address matches its advertised peer address. Later brokers contact a seed, learn its snapshot, and contact discovered peers so the membership view propagates through the reachable brokers.
+
+Example bootstrap broker:
+
+```bash
+MESSLESSMQ_BROKER_ID=broker-1 \
+MESSLESSMQ_CLUSTER_ID=orders-cluster \
+MESSLESSMQ_LISTEN_ADDRESS=127.0.0.1:9092 \
+MESSLESSMQ_ADVERTISE_ADDRESS=127.0.0.1:9092 \
+MESSLESSMQ_PEER_LISTEN_ADDRESS=127.0.0.1:19093 \
+MESSLESSMQ_PEER_ADVERTISE_ADDRESS=127.0.0.1:19093 \
+MESSLESSMQ_DATA_DIR=./data/broker-1 \
+go run ./cmd/broker
+```
+
+Example joining broker:
+
+```bash
+MESSLESSMQ_BROKER_ID=broker-2 \
+MESSLESSMQ_CLUSTER_ID=orders-cluster \
+MESSLESSMQ_LISTEN_ADDRESS=127.0.0.1:9094 \
+MESSLESSMQ_ADVERTISE_ADDRESS=127.0.0.1:9094 \
+MESSLESSMQ_PEER_LISTEN_ADDRESS=127.0.0.1:19094 \
+MESSLESSMQ_PEER_ADVERTISE_ADDRESS=127.0.0.1:19094 \
+MESSLESSMQ_SEEDS=broker-1@127.0.0.1:19093 \
+MESSLESSMQ_DATA_DIR=./data/broker-2 \
+go run ./cmd/broker
+```
+
+If `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093` is configured, inspect a broker's current membership with `curl http://127.0.0.1:9093/cluster/members`.
+
+For brokers with peer membership enabled, the broker persists `cluster_id` and `broker_id` in `<DATA_DIR>/metadata/identity.json`. Reusing that data directory with a different cluster or broker ID is rejected. Give every broker its own data directory/PVC. Peer join currently uses plaintext, unauthenticated TCP and has no heartbeat-based membership removal. Keep peer listeners on a trusted private network. Membership snapshots are per-process and in-memory; they are discovery information, not a consensus-committed controller view. This feature does not replicate partition data or elect partition leaders.
+See [CLUSTER-MEMBERSHIP-GUIDE.md](CLUSTER-MEMBERSHIP-GUIDE.md) for a three-terminal local setup. `scripts/membership-smoke.sh` builds and launches three separate broker OS processes with isolated temporary data directories, then verifies that each admin membership endpoint reports all three brokers.
 
 ## Tests and validation
 
@@ -121,7 +162,7 @@ go vet ./...
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
-The three services listen on host ports `19092`, `19093`, and `19094`. Each has a separate named data volume. These are independent standalone brokers, not a replicated cluster.
+The three services listen on host ports `19092`, `19093`, and `19094`. Each has a separate named data volume and seed-based membership discovery. Their local admin membership snapshots are published only on loopback host ports `19101`, `19102`, and `19103`. They are still independent standalone data brokers, not a replicated cluster. Inspect membership with `curl http://127.0.0.1:19101/cluster/members` (and `19102`/`19103` for the other brokers).
 
 ## Kubernetes
 

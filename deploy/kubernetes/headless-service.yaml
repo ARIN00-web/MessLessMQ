@@ -15,3 +15,11 @@ spec:
       port: 9092
       targetPort: client
       protocol: TCP
+    - name: peer
+      port: 19093
+      targetPort: peer
+      protocol: TCP
+    - name: admin
+      port: 9093
+      targetPort: admin
+      protocol: TCP

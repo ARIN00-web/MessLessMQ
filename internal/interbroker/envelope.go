@@ -22,6 +22,7 @@ const (
 	MessageAppendEntries
 	MessageReplicationBatch
 	MessageHeartbeat
+	MessageBrokerJoin
 )
 
 var (

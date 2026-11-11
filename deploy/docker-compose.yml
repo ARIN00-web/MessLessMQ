@@ -5,6 +5,10 @@ x-broker: &broker
     - messlessmq-lab
   environment:
     MESSLESSMQ_LISTEN_ADDRESS: ":9092"
+    MESSLESSMQ_CLUSTER_ID: messlessmq-compose
+    MESSLESSMQ_PEER_LISTEN_ADDRESS: ":19093"
+    MESSLESSMQ_PEER_JOIN_TIMEOUT: 60s
+    MESSLESSMQ_ADMIN_ADDRESS: ":9093"
     MESSLESSMQ_DATA_DIR: /var/lib/messlessmq
     MESSLESSMQ_BOOTSTRAP_TOPICS: orders:3
     MESSLESSMQ_LOG_LEVEL: info
@@ -21,8 +25,10 @@ services:
       MESSLESSMQ_BOOTSTRAP_TOPICS: orders:3
       MESSLESSMQ_BROKER_ID: broker-1
       MESSLESSMQ_ADVERTISE_ADDRESS: broker-1:9092
+      MESSLESSMQ_PEER_ADVERTISE_ADDRESS: broker-1:19093
     ports:
       - "19092:9092"
+      - "127.0.0.1:19101:9093"
     volumes:
       - broker-1-data:/var/lib/messlessmq
 
@@ -34,8 +40,11 @@ services:
       MESSLESSMQ_BOOTSTRAP_TOPICS: orders:3
       MESSLESSMQ_BROKER_ID: broker-2
       MESSLESSMQ_ADVERTISE_ADDRESS: broker-2:9092
+      MESSLESSMQ_PEER_ADVERTISE_ADDRESS: broker-2:19093
+      MESSLESSMQ_SEEDS: broker-1@broker-1:19093
     ports:
       - "19093:9092"
+      - "127.0.0.1:19102:9093"
     volumes:
       - broker-2-data:/var/lib/messlessmq
 
@@ -47,8 +56,11 @@ services:
       MESSLESSMQ_BOOTSTRAP_TOPICS: orders:3
       MESSLESSMQ_BROKER_ID: broker-3
       MESSLESSMQ_ADVERTISE_ADDRESS: broker-3:9092
+      MESSLESSMQ_PEER_ADVERTISE_ADDRESS: broker-3:19093
+      MESSLESSMQ_SEEDS: broker-1@broker-1:19093,broker-2@broker-2:19093
     ports:
       - "19094:9092"
+      - "127.0.0.1:19103:9093"
     volumes:
       - broker-3-data:/var/lib/messlessmq
 

@@ -11,11 +11,13 @@ The runtime composes these pieces for a **single standalone broker**:
 - One append-only partition log per configured topic partition under `<MESSLESSMQ_DATA_DIR>/logs`.
 - PRODUCE API v1 with partition routing, persisted message keys, and `none`, `leader`, and `all` acknowledgement modes.
 - CONSUME API v1 for the original value-only response and API v2 for key/value records.
-- METADATA API v1 that advertises the local broker and its local partition set.
+- METADATA API v1 that advertises the local broker and partition set; when membership discovery is enabled, the broker list includes known peer addresses, while partition ownership remains local.
 - Configured connection limits, request deadlines, IP-based token-bucket admission control, and request metrics.
 - Optional TLS/mTLS on the client listener when certificate configuration is supplied.
 - Optional HTTP health, readiness, diagnostics, and metrics endpoints when `MESSLESSMQ_ADMIN_ADDRESS` is configured.
 - Graceful drain of in-flight operations followed by partition-log close.
+- Optional seed-based broker membership discovery over a separate inter-broker TCP listener, plus a private admin `GET /cluster/members` endpoint.
+- Persistent cluster/broker identity pinning at `<DATA_DIR>/metadata/identity.json` whenever peer membership is enabled.
 
 The runtime integration test starts a real TCP listener, produces a keyed record with a synchronous leader acknowledgement, consumes it, retrieves metadata, stops the server, reconstructs it from the same data directory, and consumes the record again.
 
@@ -23,16 +25,17 @@ The runtime integration test starts a real TCP listener, produces a keyed record
 
 MessLessMQ now has a functioning **single-broker runtime**. The repository also contains separate educational implementations of a controller, cluster metadata model, replication manager, inter-broker TCP transport, reassignment/recovery coordinators, consumer groups, and offset store.
 
-Those distributed packages are not yet assembled into one multi-process control/data plane. In particular:
+Some broker-to-broker discovery is now wired into a multi-process control-plane edge, but the distributed packages are not yet assembled into one authoritative control/data plane. In particular:
 
-- The runtime's metadata handler describes only the local broker and local partitions; it does not read committed metadata from a distributed controller.
+- Brokers can join one another through configured seed peers and exchange in-memory membership snapshots. This is discovery only; there is no heartbeat/lease failure detector, membership removal protocol, or durable membership consensus.
+- The runtime's metadata handler can advertise discovered brokers, but partition metadata still describes only the local broker and local partitions; it does not read committed metadata from a distributed controller.
 - The runtime's replication manager is not connected to remote broker processes through `internal/interbroker`.
 - The controller's Raft-style cluster is still an in-memory simulation, not a durable three-node consensus service.
-- The broker does not dynamically register itself with a live remote controller or receive authoritative partition assignments.
+- The broker does not register itself with an authoritative controller or receive committed partition assignments.
 - The client router is a package-level metadata cache; the CLI currently connects to the address supplied by the user and does not automatically route requests to a partition leader.
 - Consumer group membership, group coordination, and committed-offset APIs are not exposed end-to-end through the public broker TCP request pipeline. The current CLI consume operation is an explicit stateless partition/offset fetch.
 
-Therefore the three Docker Compose services and three Kubernetes StatefulSet pods are **three independently operating standalone brokers**, not a replicated three-broker cluster. They have distinct broker identities, data directories, and durable volumes, but do not replicate records between each other or fail over partition leadership.
+Therefore the three Docker Compose services and three Kubernetes StatefulSet pods can now discover one another and expose a common configured cluster ID, but they are still **three independently operating standalone data brokers**, not a replicated three-broker cluster. They have distinct broker identities, data directories, and durable volumes. Membership does not replicate records between them or fail over partition leadership.
 
 ## 3. Storage and message-format behavior
 
@@ -57,6 +60,8 @@ A produce batch is not transactional. The handler validates the routing plan bef
 ## 5. Deployment assets
 
 - The Docker image runs as a non-root user and writes data below `/var/lib/messlessmq`.
+- Compose and Kubernetes configure one shared cluster ID, unique broker IDs, peer listeners, advertised peer addresses, and seed discovery. The Kubernetes bootstrap pod lists itself as a self seed, which the startup join logic ignores.
+- Each peer-enabled data directory stores a durable cluster/broker identity in `metadata/identity.json`; changing either identity while reusing that data directory is rejected.
 - Compose assigns a distinct named volume to each standalone broker.
 - The Kubernetes StatefulSet uses stable pod identities and one persistent volume claim per pod. A working StorageClass/provisioner is required for PVC binding.
 - The Kubernetes TCP probes only prove that the process accepts a TCP connection; they do not establish replication health or quorum readiness.
@@ -76,16 +81,17 @@ Persistent volumes protect local broker files against pod replacement where the 
 
 ## 7. Remaining work before claiming a distributed production broker
 
-1. Persist controller current term, vote, log, commit index, and applied metadata; recover them before elections.
-2. Run a controller quorum across separate processes and carry RequestVote/AppendEntries over authenticated, TLS-protected peer connections.
-3. Connect remote replication batches to the inter-broker transport, including bounded retry, timeout, epoch fencing, follower truncation, and catch-up.
-4. Make partition placement authoritative and provision the correct local replica logs on each broker.
-5. Route produce/fetch requests to partition leaders using refreshed cluster metadata.
-6. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
-7. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a secure TLS-capable client.
-8. Define batch retry/idempotency semantics across partial appends and server restarts.
-9. Add replicated end-to-end tests for produce, follower failure, leader election, catch-up, consumer failover, and controller quorum loss.
-10. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
+1. Add authenticated/TLS-protected peer communication and heartbeat/lease-based membership health and removal; the current join protocol is plaintext and unauthenticated.
+2. Persist controller current term, vote, log, commit index, and applied metadata; recover them before elections.
+3. Run a controller quorum across separate processes and carry RequestVote/AppendEntries over authenticated, TLS-protected peer connections.
+4. Connect remote replication batches to the inter-broker transport, including bounded retry, timeout, epoch fencing, follower truncation, and catch-up.
+5. Make partition placement authoritative and provision the correct local replica logs on each broker.
+6. Route produce/fetch requests to partition leaders using refreshed cluster metadata.
+7. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
+8. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a secure TLS-capable client.
+9. Define batch retry/idempotency semantics across partial appends and server restarts.
+10. Add replicated end-to-end tests for produce, follower failure, leader election, catch-up, consumer failover, and controller quorum loss.
+11. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
 
 ## 8. Delivery semantics caution
 

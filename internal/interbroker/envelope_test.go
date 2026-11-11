@@ -36,3 +36,21 @@ func TestEnvelopeRejectsMalformedAndOversizedInput(t *testing.T) {
 		t.Fatalf("invalid flags error = %v", err)
 	}
 }
+
+func TestBrokerJoinMessageTypeIsStableAndRoundTrips(t *testing.T) {
+	if MessageBrokerJoin != 5 {
+		t.Fatalf("MessageBrokerJoin = %d, want 5", MessageBrokerJoin)
+	}
+	want := Envelope{Type: MessageBrokerJoin, RequestID: 7, SourceID: "broker-b", TargetID: "broker-a", Payload: []byte("join")}
+	encoded, err := EncodeEnvelope(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeEnvelope(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != MessageBrokerJoin || string(got.Payload) != "join" {
+		t.Fatalf("decoded envelope = %+v", got)
+	}
+}

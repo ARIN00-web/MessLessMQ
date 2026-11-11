@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/ARIN00-web/messlessmq/internal/broker"
 	"github.com/ARIN00-web/messlessmq/internal/config"
+	"github.com/ARIN00-web/messlessmq/internal/interbroker"
+	"github.com/ARIN00-web/messlessmq/internal/membership"
 	"github.com/ARIN00-web/messlessmq/internal/network"
 	"github.com/ARIN00-web/messlessmq/internal/observability"
 	"github.com/ARIN00-web/messlessmq/internal/operations"
@@ -48,6 +51,8 @@ type Server struct {
 	produced    *observability.Counter
 	consumed    *observability.Counter
 	latency     *observability.Histogram
+	members     *membership.Registry
+	seeds       []membership.Seed
 	health      *observability.HealthChecker
 	diagnostics *observability.Diagnostics
 
@@ -64,6 +69,11 @@ func New(options Options) (*Server, error) {
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+	if cfg.PeerListenAddress != "" {
+		if err := membership.EnsureIdentity(cfg.DataDir, cfg.ClusterID, cfg.BrokerID); err != nil {
+			return nil, fmt.Errorf("verify persistent broker identity: %w", err)
+		}
 	}
 	definitions, err := loadTopicCatalog(cfg.DataDir, options.BootstrapTopics)
 	if err != nil {
@@ -116,8 +126,25 @@ func New(options Options) (*Server, error) {
 		return nil, err
 	}
 
+	var members *membership.Registry
+	var seeds []membership.Seed
+	if cfg.PeerListenAddress != "" {
+		members, err = membership.NewRegistry(cfg.ClusterID, membership.Broker{
+			ID: cfg.BrokerID, ClientAddress: cfg.AdvertiseAddress, PeerAddress: cfg.PeerAdvertiseAddress,
+		})
+		if err != nil {
+			_ = closeTopics(opened)
+			return nil, fmt.Errorf("initialize broker membership: %w", err)
+		}
+		seeds, err = membership.ParseSeeds(cfg.SeedPeers)
+		if err != nil {
+			_ = closeTopics(opened)
+			return nil, err
+		}
+	}
+
 	dispatcher := broker.NewDispatcher(registry)
-	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry})
+	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members})
 	health := observability.NewHealthChecker()
 	if err := health.Register("partition_logs", 2*time.Second, func(ctx context.Context) error {
 		for _, registeredTopic := range opened {
@@ -140,7 +167,7 @@ func New(options Options) (*Server, error) {
 		cfg: cfg, adminAddr: strings.TrimSpace(options.AdminAddress), logger: options.Logger,
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
-		produced: produced, consumed: consumed, latency: latency, health: health,
+		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds, health: health,
 		diagnostics: observability.NewDiagnostics(),
 	}, nil
 }
@@ -157,6 +184,7 @@ func closeTopics(topics []*topic.Topic) error {
 
 func (s *Server) Registry() *topic.Registry        { return s.registry }
 func (s *Server) Metrics() *observability.Registry { return s.metrics }
+func (s *Server) Membership() *membership.Registry { return s.members }
 
 func (s *Server) Run(ctx context.Context) error {
 	if s == nil {
@@ -164,6 +192,14 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	if ctx == nil {
 		return errors.New("server context is nil")
+	}
+	stopPeer, err := s.startPeerRuntime(ctx)
+	if err != nil {
+		closeErr := closeTopics(s.topics)
+		return errors.Join(err, closeErr)
+	}
+	if stopPeer != nil {
+		defer stopPeer()
 	}
 	listener, err := net.Listen("tcp", s.cfg.ListenAddress)
 	if err != nil {
@@ -181,6 +217,85 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.logger.Info("broker listening", "broker_id", s.cfg.BrokerID, "address", listener.Addr().String(), "advertise_address", s.cfg.AdvertiseAddress, "topics", s.registry.List())
 	return s.Serve(ctx, listener)
+}
+
+func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
+	if s == nil || s.members == nil {
+		return nil, nil
+	}
+	listener, err := net.Listen("tcp", s.cfg.PeerListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("listen on peer address %s: %w", s.cfg.PeerListenAddress, err)
+	}
+	mux := interbroker.NewMux()
+	handler, err := membership.NewHandler(s.members)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	if err := mux.Register(interbroker.MessageBrokerJoin, handler); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	peerServer, err := interbroker.NewServer(mux)
+	if err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	peerDone := make(chan error, 1)
+	go func() { peerDone <- peerServer.Serve(listener) }()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			_ = listener.Close()
+			<-peerDone
+		})
+	}
+
+	if len(s.seeds) > 0 {
+		transport := interbroker.NewTransport(2 * time.Second)
+		deadline := time.NewTimer(s.cfg.PeerJoinTimeout)
+		defer deadline.Stop()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		var joinErr error
+		for {
+			joinCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			joinErr = s.members.Join(joinCtx, transport, s.seeds)
+			cancel()
+			if joinErr == nil {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				stop()
+				return nil, fmt.Errorf("join broker cluster: %w", ctx.Err())
+			case <-deadline.C:
+				stop()
+				return nil, fmt.Errorf("join broker cluster before timeout: %w", joinErr)
+			case <-ticker.C:
+			}
+		}
+	}
+	snapshot := s.members.Snapshot()
+	s.logger.Info("broker cluster membership ready", "cluster_id", snapshot.ClusterID, "version", snapshot.Version, "members", len(snapshot.Brokers), "peer_address", listener.Addr().String())
+	return stop, nil
+}
+
+func (s *Server) handleClusterMembers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.members == nil {
+		http.Error(w, "cluster membership is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.members.Snapshot()); err != nil {
+		return
+	}
 }
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
@@ -206,6 +321,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.Handle("/health/live", observability.LivenessHandler())
 		mux.Handle("/health/ready", s.health.ReadinessHandler())
 		mux.Handle("/diagnostics", s.diagnostics.Handler())
+		if s.members != nil {
+			mux.HandleFunc("/cluster/members", s.handleClusterMembers)
+		}
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {
 				w.Header().Set("Allow", http.MethodGet)

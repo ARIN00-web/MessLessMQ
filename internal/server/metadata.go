@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 
+	"github.com/ARIN00-web/messlessmq/internal/membership"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
@@ -11,6 +12,7 @@ type localMetadataHandler struct {
 	brokerID string
 	address  string
 	registry *topic.Registry
+	members  *membership.Registry
 }
 
 func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) {
@@ -30,6 +32,15 @@ func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) 
 	response := protocol.MetadataResponse{
 		Version: 1,
 		Brokers: []protocol.BrokerMetadata{{ID: h.brokerID, Address: h.address}},
+	}
+	if h.members != nil {
+		snapshot := h.members.Snapshot()
+		response.Brokers = response.Brokers[:0]
+		for _, member := range snapshot.Brokers {
+			response.Brokers = append(response.Brokers, protocol.BrokerMetadata{
+				ID: member.ID, Address: member.ClientAddress,
+			})
+		}
 	}
 	for _, topicName := range h.registry.List() {
 		if metadataRequest.Topic != "" && metadataRequest.Topic != topicName {
