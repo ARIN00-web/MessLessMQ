@@ -124,3 +124,68 @@ func validProducerID(id string) bool {
 	}
 	return true
 }
+
+var messageMagic = [8]byte{'M', 'L', 'M', 'Q', 'M', 'S', 'G', '1'}
+
+const messageHeaderSize = 8 + 1 + 4 + 4
+
+// EncodeMessage stores a message key beside its value in one checksummed log
+// payload. A nil key is distinct from an empty-but-present key.
+func EncodeMessage(key, value []byte) ([]byte, error) {
+	if len(key) > MaxPayloadSize || len(value) > MaxPayloadSize || len(key)+len(value) > MaxPayloadSize {
+		return nil, ErrPayloadTooLarge
+	}
+	keyLength := uint32(len(key))
+	if key == nil {
+		keyLength = ^uint32(0)
+	}
+	total := messageHeaderSize + len(key) + len(value) + checksumSize
+	out := make([]byte, total)
+	copy(out[:8], messageMagic[:])
+	out[8] = version
+	binary.BigEndian.PutUint32(out[9:13], keyLength)
+	binary.BigEndian.PutUint32(out[13:17], uint32(len(value)))
+	cursor := messageHeaderSize
+	copy(out[cursor:], key)
+	cursor += len(key)
+	copy(out[cursor:], value)
+	cursor += len(value)
+	binary.BigEndian.PutUint32(out[cursor:], crc32.ChecksumIEEE(out[:cursor]))
+	return out, nil
+}
+
+// DecodeMessage unwraps the stored key/value envelope. isEnvelope is false for
+// records written before key persistence was introduced; those bytes are
+// returned as the original value with a nil key.
+func DecodeMessage(data []byte) (key, value []byte, isEnvelope bool, err error) {
+	if len(data) < len(messageMagic) || string(data[:len(messageMagic)]) != string(messageMagic[:]) {
+		return nil, append([]byte(nil), data...), false, nil
+	}
+	if len(data) < messageHeaderSize+checksumSize || data[8] != version {
+		return nil, nil, true, ErrInvalidEnvelope
+	}
+	keyLength := binary.BigEndian.Uint32(data[9:13])
+	valueLength := binary.BigEndian.Uint32(data[13:17])
+	actualKeyLength := uint64(keyLength)
+	if keyLength == ^uint32(0) {
+		actualKeyLength = 0
+	}
+	if actualKeyLength > MaxPayloadSize || uint64(valueLength) > MaxPayloadSize || actualKeyLength+uint64(valueLength) > MaxPayloadSize {
+		return nil, nil, true, ErrInvalidEnvelope
+	}
+	expected := uint64(messageHeaderSize) + actualKeyLength + uint64(valueLength) + checksumSize
+	if expected != uint64(len(data)) {
+		return nil, nil, true, ErrInvalidEnvelope
+	}
+	checksumOffset := len(data) - checksumSize
+	if binary.BigEndian.Uint32(data[checksumOffset:]) != crc32.ChecksumIEEE(data[:checksumOffset]) {
+		return nil, nil, true, fmt.Errorf("%w: message checksum mismatch", ErrInvalidEnvelope)
+	}
+	cursor := messageHeaderSize
+	if keyLength != ^uint32(0) {
+		key = append([]byte{}, data[cursor:cursor+int(actualKeyLength)]...)
+		cursor += int(actualKeyLength)
+	}
+	value = append([]byte(nil), data[cursor:checksumOffset]...)
+	return key, value, true, nil
+}

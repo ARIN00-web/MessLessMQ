@@ -17,21 +17,42 @@ spec:
       labels:
         app.kubernetes.io/name: messlessmq
     spec:
-      terminationGracePeriodSeconds: 20
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: broker
-          image: messlessmq:phase20
+          image: messlessmq:integrated
           imagePullPolicy: IfNotPresent
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MESSLESSMQ_BROKER_ID
+              value: "$(POD_NAME)"
+            - name: MESSLESSMQ_LISTEN_ADDRESS
+              value: ":9092"
+            - name: MESSLESSMQ_ADVERTISE_ADDRESS
+              value: "$(POD_NAME).messlessmq-headless.messlessmq.svc.cluster.local:9092"
+            - name: MESSLESSMQ_DATA_DIR
+              value: /var/lib/messlessmq
+            - name: MESSLESSMQ_BOOTSTRAP_TOPICS
+              value: "orders:3"
+            - name: MESSLESSMQ_LOG_LEVEL
+              value: info
           ports:
             - name: client
               containerPort: 9092
               protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/messlessmq
           resources:
             requests:
               cpu: 100m
@@ -60,3 +81,12 @@ spec:
               port: client
             periodSeconds: 10
             failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi

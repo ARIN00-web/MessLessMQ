@@ -13,6 +13,7 @@ const (
 	ErrorOffsetBeforeStart  uint16 = 9
 	ErrorInvalidFetchLimit  uint16 = 10
 	ErrorUnsupportedVersion uint16 = 11
+	ErrorRateLimited        uint16 = 12
 )
 
 type Response struct {

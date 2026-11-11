@@ -27,6 +27,7 @@ type ConsumeRequest struct {
 type ConsumeRecord struct {
 	Offset    uint64
 	Timestamp int64
+	Key       []byte
 	Value     []byte
 }
 

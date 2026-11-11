@@ -27,14 +27,15 @@ type partitionKey struct {
 	partitionID uint32
 }
 
-// Record is one message returned by a partition fetch. The current storage
-// record format persists payload and timestamp; producer keys are not yet
-// stored as independent record fields.
+// Record is one message returned by a partition fetch. Runtime-produced
+// messages persist key and value together in a checksummed record envelope.
+// Legacy raw records are returned with a nil key.
 type Record struct {
 	Topic            string
 	Partition        uint32
 	Offset           uint64
 	Timestamp        int64
+	Key              []byte
 	Value            []byte
 	ProducerID       string
 	ProducerEpoch    uint64
@@ -350,18 +351,29 @@ func fetchFromPartition(partition *topic.Partition, offset uint64, maxMessages u
 			}
 			return FetchResult{}, fmt.Errorf("read topic %q partition %d offset %d: %w", partition.TopicName(), partition.ID(), cursor, err)
 		}
-		producerMeta, applicationValue, isEnvelope, decodeErr := recordmeta.Decode(value)
+		messageKey, messageValue, hasMessageEnvelope, decodeErr := recordmeta.DecodeMessage(value)
+		if decodeErr != nil {
+			return FetchResult{}, fmt.Errorf("decode message envelope at offset %d: %w", cursor, decodeErr)
+		}
+		if !hasMessageEnvelope {
+			messageValue = value
+		}
+		producerMeta, applicationValue, isProducerEnvelope, decodeErr := recordmeta.Decode(messageValue)
 		if decodeErr != nil {
 			return FetchResult{}, fmt.Errorf("decode record metadata at offset %d: %w", cursor, decodeErr)
+		}
+		if !isProducerEnvelope {
+			applicationValue = messageValue
 		}
 		record := Record{
 			Topic:     partition.TopicName(),
 			Partition: partition.ID(),
 			Offset:    cursor,
 			Timestamp: timestamp,
+			Key:       messageKey,
 			Value:     applicationValue,
 		}
-		if isEnvelope {
+		if isProducerEnvelope {
 			record.ProducerID = producerMeta.ProducerID
 			record.ProducerEpoch = producerMeta.Epoch
 			record.ProducerSequence = producerMeta.Sequence

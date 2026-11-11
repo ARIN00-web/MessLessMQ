@@ -30,7 +30,7 @@ func NewDispatcher(registries ...*topic.Registry) *Dispatcher {
 		registry = registries[0]
 	}
 	return &Dispatcher{
-		produceHandler: NewProduceHandler(),
+		produceHandler: NewProduceHandler(registry),
 		consumeHandler: NewConsumeHandler(registry),
 	}
 }

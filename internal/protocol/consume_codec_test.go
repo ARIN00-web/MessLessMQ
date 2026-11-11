@@ -195,3 +195,21 @@ func TestDecodeConsumeResponseRejectsTrailingBytes(t *testing.T) {
 		t.Fatalf("DecodeConsumeResponse() error = %v, want ErrInvalidRequest", err)
 	}
 }
+
+func TestConsumeResponseV2RoundTripPreservesKeys(t *testing.T) {
+	original := ConsumeResponse{StartOffset: 4, LogEndOffset: 6, NextOffset: 6, Records: []ConsumeRecord{
+		{Offset: 4, Timestamp: 100, Key: nil, Value: []byte("nil-key")},
+		{Offset: 5, Timestamp: 101, Key: []byte("customer-7"), Value: []byte("keyed")},
+	}}
+	encoded, err := EncodeConsumeResponseV2(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeConsumeResponseV2(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Records) != 2 || decoded.Records[0].Key != nil || string(decoded.Records[1].Key) != "customer-7" || string(decoded.Records[1].Value) != "keyed" {
+		t.Fatalf("unexpected V2 response: %+v", decoded)
+	}
+}

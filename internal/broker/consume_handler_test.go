@@ -112,7 +112,7 @@ func TestConsumeHandlerRejectsOffsetBeyondLogEnd(t *testing.T) {
 func TestConsumeHandlerRejectsUnsupportedVersion(t *testing.T) {
 	_, handler := setupConsumeHandler(t)
 	req := makeConsumeRequest(t, "orders", 0, 0, 10)
-	req.APIVersion = 2
+	req.APIVersion = 99
 	_, err := handler.Handle(req)
 	if !errors.Is(err, protocol.ErrUnsupportedVersion) {
 		t.Fatalf("Handle() error = %v, want ErrUnsupportedVersion", err)

@@ -66,3 +66,40 @@ func TestEncodeRejectsOversizedPayload(t *testing.T) {
 		t.Fatalf("error = %v, want ErrPayloadTooLarge", err)
 	}
 }
+
+func TestStoredMessageRoundTripPreservesNilAndEmptyKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		key  []byte
+	}{{name: "nil key", key: nil}, {name: "empty key", key: []byte{}}, {name: "normal key", key: []byte("account-7")}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := EncodeMessage(tc.key, []byte("payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			key, value, isEnvelope, err := DecodeMessage(encoded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !isEnvelope || string(value) != "payload" {
+				t.Fatalf("decode got envelope=%t value=%q", isEnvelope, value)
+			}
+			if (key == nil) != (tc.key == nil) || string(key) != string(tc.key) {
+				t.Fatalf("key=%v want=%v", key, tc.key)
+			}
+		})
+	}
+}
+
+func TestStoredMessageRejectsChecksumCorruption(t *testing.T) {
+	encoded, err := EncodeMessage([]byte("key"), []byte("value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded[len(encoded)-1] ^= 1
+	_, _, isEnvelope, err := DecodeMessage(encoded)
+	if !isEnvelope || !errors.Is(err, ErrInvalidEnvelope) {
+		t.Fatalf("got envelope=%t err=%v", isEnvelope, err)
+	}
+}

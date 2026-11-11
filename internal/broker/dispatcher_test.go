@@ -8,15 +8,11 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
-func TestDispatcherProduce(t *testing.T) {
+func TestDispatcherProduceRejectsMalformedPayload(t *testing.T) {
 	dispatcher := NewDispatcher()
 	req := protocol.Request{APIKey: protocol.APIPRODUCE, APIVersion: 1, CorrelationID: 1, Payload: []byte("test")}
-	response, err := dispatcher.Dispatch(req)
-	if err != nil {
-		t.Fatalf("Dispatch failed: %v", err)
-	}
-	if string(response) != "PRODUCE handler not implemented" {
-		t.Fatalf("unexpected response: %q", response)
+	if _, err := dispatcher.Dispatch(req); err == nil {
+		t.Fatal("expected malformed produce payload to fail")
 	}
 }
 

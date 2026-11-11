@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "topics": [
+    {
+      "name": "orders",
+      "partitions": 3
+    },
+    {
+      "name": "payments",
+      "partitions": 1
+    }
+  ]
+}

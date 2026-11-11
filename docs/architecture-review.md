@@ -1,83 +1,98 @@
 # MessLessMQ — Final Architecture Review
 
-## 1. Architectural shape
+## 1. What is now integrated into the broker executable
 
-MessLessMQ is organized around a broker data plane and a cluster control plane.
+The current `cmd/broker` entrypoint loads validated environment configuration, parses bootstrap topics, creates a structured logger, constructs `internal/server.Server`, and runs it with SIGINT/SIGTERM cancellation.
 
-### Data plane
+The runtime composes these pieces for a **single standalone broker**:
 
-- A length-prefixed TCP connection handler reads request frames and dispatches protocol APIs.
-- The binary protocol models requests, responses, correlation IDs, produce/fetch operations, and metadata.
-- The storage package implements an append-only segmented log with offset/time indexes, retention, recovery, and explicit synchronization operations.
-- Topic/partition abstractions provide logical message-stream organization.
-- Producer metadata and delivery packages explore idempotence, duplicate handling, and effectively-once local effects.
-- Consumer, group, and offset packages model fetch positions, group ownership, rebalancing, and durable committed offsets.
-- Replication models leader/follower replicas, ISR, leader epochs, and an exclusive high watermark.
+- A TCP listener and the existing length-prefixed binary request protocol.
+- A shared topic registry opened from a durable topic catalog at `<MESSLESSMQ_DATA_DIR>/metadata/topics.json`.
+- One append-only partition log per configured topic partition under `<MESSLESSMQ_DATA_DIR>/logs`.
+- PRODUCE API v1 with partition routing, persisted message keys, and `none`, `leader`, and `all` acknowledgement modes.
+- CONSUME API v1 for the original value-only response and API v2 for key/value records.
+- METADATA API v1 that advertises the local broker and its local partition set.
+- Configured connection limits, request deadlines, IP-based token-bucket admission control, and request metrics.
+- Optional TLS/mTLS on the client listener when certificate configuration is supplied.
+- Optional HTTP health, readiness, diagnostics, and metrics endpoints when `MESSLESSMQ_ADMIN_ADDRESS` is configured.
+- Graceful drain of in-flight operations followed by partition-log close.
 
-### Control plane
+The runtime integration test starts a real TCP listener, produces a keyed record with a synchronous leader acknowledgement, consumes it, retrieves metadata, stops the server, reconstructs it from the same data directory, and consumes the record again.
 
-- The controller package is a fixed-membership, in-memory Raft-style model with terms, votes, log matching, majority commit, and metadata application.
-- The cluster package models broker registration, partition placement, metadata snapshots, and client-side leader lookup.
-- The inter-broker package defines framed request/response transport and controller handlers.
-- Recovery packages coordinate reassignment and replica, broker, group, and controller recovery workflows.
+## 2. Runtime topology versus distributed topology
 
-### Operational building blocks
+MessLessMQ now has a functioning **single-broker runtime**. The repository also contains separate educational implementations of a controller, cluster metadata model, replication manager, inter-broker TCP transport, reassignment/recovery coordinators, consumer groups, and offset store.
 
-- Performance primitives cover batching, buffers, sequential writing, latency recording, and bounded backpressure.
-- Observability includes metrics, structured logging, health and diagnostics handlers.
-- Security includes API-key authentication, ACL authorization, TLS helpers, and rate limiting.
-- Configuration validates environment-driven settings; operations controls model pause/drain/shutdown behavior.
+Those distributed packages are not yet assembled into one multi-process control/data plane. In particular:
 
-## 2. Important implementation boundary
+- The runtime's metadata handler describes only the local broker and local partitions; it does not read committed metadata from a distributed controller.
+- The runtime's replication manager is not connected to remote broker processes through `internal/interbroker`.
+- The controller's Raft-style cluster is still an in-memory simulation, not a durable three-node consensus service.
+- The broker does not dynamically register itself with a live remote controller or receive authoritative partition assignments.
+- The client router is a package-level metadata cache; the CLI currently connects to the address supplied by the user and does not automatically route requests to a partition leader.
+- Consumer group membership, group coordination, and committed-offset APIs are not exposed end-to-end through the public broker TCP request pipeline. The current CLI consume operation is an explicit stateless partition/offset fetch.
 
-Passing package tests demonstrates the behavior covered by those tests. It does not mean all packages are composed into one production broker runtime.
+Therefore the three Docker Compose services and three Kubernetes StatefulSet pods are **three independently operating standalone brokers**, not a replicated three-broker cluster. They have distinct broker identities, data directories, and durable volumes, but do not replicate records between each other or fail over partition leadership.
 
-At the end of Phase 19, the broker executable remains a simple TCP process. The repository has separate packages for controller, cluster metadata, replication, observability, security, configuration, and operations, but the complete lifecycle is not yet wired end-to-end through `cmd/broker` and the live request pipeline.
+## 3. Storage and message-format behavior
 
-The three-container Docker Compose and three-pod Kubernetes assets in this phase therefore launch **three standalone broker processes**. They are a deployment/topology lab, not a functioning replicated cluster. They do not share metadata, replicate records, elect partition leaders, or automatically route clients between brokers.
+The runtime persists its topic/partition catalog atomically in `metadata/topics.json`. It opens each configured partition log on startup and relies on the storage engine's existing segment recovery.
 
-The current broker entrypoint listens on `:9092`; the manifests map separate host ports or give each pod its own network namespace. The current entrypoint does not yet make the Phase 19 data-directory, broker-ID, or listener configuration drive the full storage/replication lifecycle.
+New PRODUCE requests store key and value together in the `MLMQMSG1` envelope, which includes a CRC32 checksum. CONSUME API v2 unwraps this envelope and returns both fields. API v1 remains compatible with the older value-only response layout. Legacy raw log records are returned as values with a nil key.
 
-## 3. Strengths
+The catalog is persistent, but topic creation/deletion and partition-count changes are not exposed as a live administrative API. A persisted topic's partition count is treated as immutable at startup; a mismatch in bootstrap configuration is rejected.
 
-- Clear package boundaries and a progressive implementation path.
-- Binary framing rather than assuming TCP preserves message boundaries.
-- Append-only storage and explicit durability operations.
-- Explicit delivery semantics, offsets, and consumer-group generation concepts.
-- Replication concepts are separated from controller metadata consensus.
-- High watermark is exclusive and is used to distinguish committed data.
-- Tests cover failure paths as well as happy paths; race-detector validation has been run throughout the project.
-- Performance work includes measurements rather than only intuition.
+A produce batch is not transactional. The handler validates the routing plan before the first append, but a disk error partway through a multi-record batch can leave earlier records appended. `acks=leader` synchronizes the local partition log before acknowledging. In this standalone runtime, `acks=all` is also a local durable acknowledgement because the local broker is the entire replica set; it is **not** a distributed ISR quorum acknowledgement.
 
-## 4. Gaps before production claims
+## 4. Security and operations integration
 
-1. **Runtime composition:** wire configuration, storage, topic registry, partition routing, replication, controller, security, observability, and operations into broker startup and request handling.
-2. **Durable controller state:** persist current term, voted-for, log, commit index, and applied metadata; recover them before participating in an election.
-3. **Real consensus transport:** connect controller RPCs to the inter-broker transport with bounded retries, deadlines, authentication, TLS, and clear message-version compatibility.
-4. **Replication transport:** connect replication batches to actual remote broker processes; handle timeout, duplicate batch, follower truncation/catch-up, and leader-epoch fencing over the wire.
-5. **Persistent metadata:** persist topics, partitions, replica assignments, broker registrations, and controller metadata; reconcile metadata with disk on restart.
-6. **Data integrity:** add a checksum/CRC to the record format, plan a versioned migration, and define how corrupted segments are quarantined or recovered.
-7. **Security integration:** enforce authentication and ACLs on the custom TCP protocol and inter-broker connections; ensure TLS is not merely configured but actually used by listeners and clients.
-8. **Observability integration:** export metrics and health from the running process with protected management endpoints; avoid high-cardinality labels and secret leakage.
-9. **Backpressure integration:** connect bounded queues and rate limits to network reads, request dispatch, replication, and storage admission.
-10. **Shutdown integration:** stop accepting new requests, drain in-flight produces, flush/sync storage, transfer leadership where possible, then close peer connections.
-11. **Real distributed testing:** automate multi-process tests for leader failure, quorum loss, broker restart, lagging follower, disk-full behavior, network partitions, and data integrity.
-12. **Operational SLOs:** define durability/availability promises and measure p95/p99 latency, throughput, recovery time, and replication lag under representative workloads.
+- TLS and optional mutual TLS can be enabled on the live broker listener through the environment configuration.
+- Request rate limiting is active in the runtime and currently keys clients by remote IP address.
+- API-key authentication and ACL authorization packages exist but are not wired into the custom binary TCP request path.
+- The CLI currently supports plaintext TCP only; it has no TLS flags or client certificate loading.
+- The optional HTTP admin endpoints are not authenticated by this runtime. Bind `MESSLESSMQ_ADMIN_ADDRESS` only to loopback or a trusted private management network. Do not expose it publicly.
+- Metrics count requests, errors, produced messages, consume requests, and dispatch latency. Health checks inspect local partition-log offset access.
+- Graceful shutdown stops accepting new connections, drains operations until the configured timeout, closes remaining client sockets, and closes topic logs.
 
-## 5. Delivery semantics caution
+## 5. Deployment assets
 
-The implementation distinguishes at-most-once, at-least-once, idempotent producer behavior, and local effectively-once effect tracking. It must not be described as a general exactly-once transaction system for arbitrary external databases or APIs. Exactly-once side effects require the destination to participate in a transaction or provide idempotency/deduplication semantics.
+- The Docker image runs as a non-root user and writes data below `/var/lib/messlessmq`.
+- Compose assigns a distinct named volume to each standalone broker.
+- The Kubernetes StatefulSet uses stable pod identities and one persistent volume claim per pod. A working StorageClass/provisioner is required for PVC binding.
+- The Kubernetes TCP probes only prove that the process accepts a TCP connection; they do not establish replication health or quorum readiness.
 
-## 6. Deployment guidance
+Persistent volumes protect local broker files against pod replacement where the storage provider honors the PVC. They do not make one broker's local records replicated or available from another broker.
 
-- Use Compose for local process and networking experiments.
-- Use Kubernetes StatefulSet for stable pod identity and orchestration experiments, not as a substitute for the broker's own replication protocol.
-- Do not expose management ports publicly until authentication, authorization, and TLS are wired into the running process.
-- Use persistent volumes only after the executable actually opens its log under the configured data directory and startup recovery has been tested.
-- A Kubernetes readiness TCP probe proves only that a socket accepts connections; it does not prove controller quorum, ISR health, or readiness to accept durable writes.
+## 6. Strengths retained from the educational phases
 
-## 7. Final assessment
+- Explicit TCP message framing rather than assuming TCP preserves message boundaries.
+- Versioned binary protocol APIs and correlation IDs.
+- Append-only segmented storage, offset/time indexes, retention, and startup recovery.
+- Explicit producer acknowledgement modes and partition routing.
+- Persistent message keys and CRC32 validation for runtime-produced records.
+- Consumer replay and explicit offsets; standalone durable offset-store package.
+- Separate replication and controller-quorum concepts, including ISR/high-watermark and term/commit-index models.
+- Race-tested package implementations and repeatable unit/integration commands.
 
-MessLessMQ has a substantial educational implementation of the core pieces of a message broker and distributed messaging system. The project is appropriate to present as a from-scratch systems engineering project with explicit experimental boundaries.
+## 7. Remaining work before claiming a distributed production broker
 
-It should not yet be represented as a production-ready Kafka replacement or an autonomous three-broker replicated service. The next engineering milestone after this curriculum is runtime integration plus durable consensus and true multi-process fault testing—not adding more isolated packages.
+1. Persist controller current term, vote, log, commit index, and applied metadata; recover them before elections.
+2. Run a controller quorum across separate processes and carry RequestVote/AppendEntries over authenticated, TLS-protected peer connections.
+3. Connect remote replication batches to the inter-broker transport, including bounded retry, timeout, epoch fencing, follower truncation, and catch-up.
+4. Make partition placement authoritative and provision the correct local replica logs on each broker.
+5. Route produce/fetch requests to partition leaders using refreshed cluster metadata.
+6. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
+7. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a secure TLS-capable client.
+8. Define batch retry/idempotency semantics across partial appends and server restarts.
+9. Add replicated end-to-end tests for produce, follower failure, leader election, catch-up, consumer failover, and controller quorum loss.
+10. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
+
+## 8. Delivery semantics caution
+
+The codebase includes at-most-once, at-least-once, idempotent-producer, duplicate-detection, and local effect-ledger models. The current runtime's simple PRODUCE API does not yet expose the complete idempotent producer/session lifecycle. It should not be described as a general exactly-once transaction system. Exactly-once side effects require the destination to participate in a transaction or provide idempotency/deduplication semantics.
+
+## 9. Final assessment
+
+MessLessMQ now has a usable, persistent, single-broker TCP runtime with produce, consume, local metadata, startup recovery, optional listener TLS/mTLS, operational instrumentation, and a CLI. The repository also contains tested educational implementations of many distributed-system components.
+
+It is appropriate to present as a from-scratch message broker project with a functioning single-node data path and an in-progress distributed control/replication architecture. It is **not yet an autonomous replicated three-broker service or a production-ready Kafka replacement**. The next engineering milestone is to make controller quorum, broker registration, remote replication, leader routing, and failover work across real broker processes.

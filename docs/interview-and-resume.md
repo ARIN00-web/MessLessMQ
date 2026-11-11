@@ -2,11 +2,12 @@
 
 ## Resume bullets (accurate, project-stage wording)
 
-- Built a message-broker prototype in Go with a length-prefixed binary TCP protocol, request dispatch, append-only segmented storage, sparse indexes, retention, and crash-recovery tests.
+- Built a persistent single-broker runtime in Go with a length-prefixed binary TCP protocol, PRODUCE/CONSUME/METADATA APIs, deterministic partition routing, durable topic catalog, append-only partition logs, and a CLI.
+- Implemented CRC32-checked key/value record envelopes and verified that a synchronously acknowledged message survives broker SIGKILL and restart against the same data directory.
 - Implemented producer/consumer primitives including batching, offset management, consumer-group assignment, delivery semantics, and idempotency experiments.
 - Modeled partition replication with leader/follower roles, ISR membership, leader epochs, high-watermark-based committed reads, and replica catch-up.
 - Built a Raft-style in-memory metadata-controller model with voting, log matching, majority commit, and recovery tests.
-- Added reusable operational components for metrics, structured logging, authentication/ACLs, TLS configuration, rate limiting, graceful draining, and performance benchmarks.
+- Added runtime request metrics, structured logging, IP-based rate limiting, optional TLS/mTLS, health/diagnostics endpoints, and graceful draining; implemented reusable API-key/ACL components that remain to be connected to the TCP request path.
 - Validated the repository with Go unit tests, the race detector, `go vet`, package coverage, and repeatable microbenchmarks.
 
 Use verbs such as *implemented*, *modeled*, and *tested*. Do not claim production-grade Raft, exactly-once transactions across external systems, or a fully operational three-broker replicated cluster until those paths are integrated and tested across processes.

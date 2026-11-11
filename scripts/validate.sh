@@ -10,6 +10,9 @@ go test -count=1 ./...
 echo "== Race detector =="
 go test -race -count=1 ./...
 
+echo "== Build broker and client =="
+go build ./cmd/broker ./cmd/client
+
 echo "== Static analysis =="
 go vet ./...
 

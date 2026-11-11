@@ -1,0 +1,51 @@
+MessLessMQ integrated runtime overlay
+
+This archive contains only files added or changed by the integrated runtime update.
+Extract its contents into the ROOT of your existing MessLessMQ Git repository.
+It does not contain .git, go.mod, go.sum, or deleted files.
+
+Added files (13):
+  + INTEGRATION-CHANGELOG.md
+  + README.md
+  + docs/adr/0006-integrated-single-broker-runtime.md
+  + docs/runtime-integration.md
+  + internal/broker/produce_handler_test.go
+  + internal/network/framing_test.go
+  + internal/protocol/consume_v2.go
+  + internal/protocol/produce_response.go
+  + internal/protocol/produce_response_test.go
+  + internal/server/catalog.go
+  + internal/server/metadata.go
+  + internal/server/server.go
+  + internal/server/server_test.go
+
+Changed files (27):
+  * Dockerfile
+  * cmd/broker/main.go
+  * cmd/client/main.go
+  * deploy/docker-compose.yml
+  * deploy/kubernetes/statefulset.yaml
+  * docs/architecture-review.md
+  * docs/interview-and-resume.md
+  * docs/production-test-plan.md
+  * internal/broker/consume_handler.go
+  * internal/broker/consume_handler_test.go
+  * internal/broker/dispatcher.go
+  * internal/broker/dispatcher_test.go
+  * internal/broker/handler.go
+  * internal/broker/handler_test.go
+  * internal/broker/produce_handler.go
+  * internal/consumer/consumer.go
+  * internal/network/connection.go
+  * internal/network/framing.go
+  * internal/protocol/consume.go
+  * internal/protocol/consume_codec_test.go
+  * internal/protocol/errors.go
+  * internal/protocol/response.go
+  * internal/recordmeta/envelope.go
+  * internal/recordmeta/envelope_test.go
+  * scripts/crash-restart.sh
+  * scripts/integration.sh
+  * scripts/validate.sh
+
+No files were removed.

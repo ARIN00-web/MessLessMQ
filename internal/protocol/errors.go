@@ -8,4 +8,5 @@ var (
 	ErrMessageTooLarge    = errors.New("message or batch too large")
 	ErrInvalidFetchLimit  = errors.New("invalid fetch limit")
 	ErrUnsupportedVersion = errors.New("unsupported API version")
+	ErrRateLimited        = errors.New("request rate limit exceeded")
 )

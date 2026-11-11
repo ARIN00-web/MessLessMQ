@@ -8,7 +8,10 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
-const ConsumeAPIVersion uint16 = 1
+const (
+	ConsumeAPIVersion  uint16 = 1
+	ConsumeAPIVersion2 uint16 = 2
+)
 
 // ConsumeHandler serves stateless fetch requests against a registered topic.
 // The client supplies the next offset on every request; durable consumer-group
@@ -35,7 +38,7 @@ func (h *ConsumeHandler) Handle(req protocol.Request) ([]byte, error) {
 	if req.APIKey != protocol.APICONSUME {
 		return nil, fmt.Errorf("%w: expected CONSUME API key", protocol.ErrInvalidRequest)
 	}
-	if req.APIVersion != ConsumeAPIVersion {
+	if req.APIVersion != ConsumeAPIVersion && req.APIVersion != ConsumeAPIVersion2 {
 		return nil, fmt.Errorf("%w: consume API version %d", protocol.ErrUnsupportedVersion, req.APIVersion)
 	}
 
@@ -84,11 +87,12 @@ func (h *ConsumeHandler) Handle(req protocol.Request) ([]byte, error) {
 	}
 	for _, record := range result.Records {
 		response.Records = append(response.Records, protocol.ConsumeRecord{
-			Offset:    record.Offset,
-			Timestamp: record.Timestamp,
-			Value:     record.Value,
+			Offset: record.Offset, Timestamp: record.Timestamp,
+			Key: record.Key, Value: record.Value,
 		})
 	}
-
+	if req.APIVersion == ConsumeAPIVersion2 {
+		return protocol.EncodeConsumeResponseV2(response)
+	}
 	return protocol.EncodeConsumeResponse(response)
 }
