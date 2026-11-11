@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"testing"
 
+	"github.com/ARIN00-web/messlessmq/internal/protocol"
 	"github.com/ARIN00-web/messlessmq/internal/replication"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
@@ -128,5 +131,71 @@ func TestApplyReplicationBatchHonorsContext(t *testing.T) {
 	}
 	if err := applyReplicationBatch(ctx, partition, batch); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestAssignedLeaderAckRemainsHiddenUntilCommitWatermarkAdvances(t *testing.T) {
+	cfg := testConfig(filepath.Join(t.TempDir(), "broker-data"))
+	cfg.ClusterID = "commit-boundary-test"
+	cfg.PeerListenAddress = "127.0.0.1:29191"
+	cfg.PeerAdvertiseAddress = "127.0.0.1:29191"
+	cfg.ReplicaAssignments = "orders:0=test-broker,broker-2"
+	cfg.MinISR = 2
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	runtime, err := New(Options{Config: cfg, BootstrapTopics: []TopicDefinition{{Name: "orders", Partitions: 1}}, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeTopics(runtime.topics)
+
+	producePayload, err := protocol.EncodeProduceRequest(protocol.ProduceRequest{
+		AckMode: protocol.AckLeader,
+		Batch:   protocol.MessageBatch{Messages: []protocol.Message{{Topic: "orders", Key: []byte("k"), Value: []byte("pending"), Timestamp: 123}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	produceResponse, err := runtime.dispatch.Dispatch(protocol.Request{APIKey: protocol.APIPRODUCE, APIVersion: 1, Payload: producePayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendResult, err := protocol.DecodeProduceResponse(produceResponse)
+	if err != nil || len(appendResult.Records) != 1 {
+		t.Fatalf("decode produce response records=%+v err=%v", appendResult.Records, err)
+	}
+	state, exists := runtime.commits.Get("orders", 0)
+	if !exists || state.HighWatermark != 0 {
+		t.Fatalf("acks=leader advanced commit state: %+v exists=%t", state, exists)
+	}
+
+	consumePayload, err := protocol.EncodeConsumeRequest(protocol.ConsumeRequest{Topic: "orders", PartitionID: 0, Offset: 0, MaxMessages: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumeResponse, err := runtime.dispatch.Dispatch(protocol.Request{APIKey: protocol.APICONSUME, APIVersion: 2, Payload: consumePayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := protocol.DecodeConsumeResponseV2(consumeResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending.Records) != 0 || pending.LogEndOffset != 0 || pending.NextOffset != 0 {
+		t.Fatalf("uncommitted record was visible: %+v", pending)
+	}
+
+	if _, err := runtime.commits.Advance("orders", 0, 1, "test-broker", 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	consumeResponse, err = runtime.dispatch.Dispatch(protocol.Request{APIKey: protocol.APICONSUME, APIVersion: 2, Payload: consumePayload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := protocol.DecodeConsumeResponseV2(consumeResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(committed.Records) != 1 || string(committed.Records[0].Value) != "pending" || committed.LogEndOffset != 1 {
+		t.Fatalf("record did not become visible after commit: %+v", committed)
 	}
 }

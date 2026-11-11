@@ -126,3 +126,54 @@ func TestConsumeHandlerRejectsMalformedPayload(t *testing.T) {
 		t.Fatalf("Handle() error = %v, want ErrInvalidRequest", err)
 	}
 }
+
+func TestConsumeHandlerDoesNotExposeUncommittedTail(t *testing.T) {
+	_, handler := setupConsumeHandler(t)
+	handler.SetHighWatermarkLookup(func(topicName string, partitionID uint32) (uint64, error) {
+		if topicName != "orders" || partitionID != 0 {
+			t.Fatalf("lookup identity = %s:%d", topicName, partitionID)
+		}
+		return 2, nil
+	})
+
+	payload, err := handler.Handle(makeConsumeRequest(t, "orders", 0, 0, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := protocol.DecodeConsumeResponse(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StartOffset != 0 || response.LogEndOffset != 2 || response.NextOffset != 2 {
+		t.Fatalf("committed response offsets = %+v, want [0,2) with next=2", response)
+	}
+	if len(response.Records) != 2 || string(response.Records[0].Value) != "first" || string(response.Records[1].Value) != "second" {
+		t.Fatalf("consume returned uncommitted tail or missed committed records: %+v", response.Records)
+	}
+
+	payload, err = handler.Handle(makeConsumeRequest(t, "orders", 0, 2, 10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	atBoundary, err := protocol.DecodeConsumeResponse(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atBoundary.Records) != 0 || atBoundary.NextOffset != 2 || atBoundary.LogEndOffset != 2 {
+		t.Fatalf("fetch at committed boundary = %+v", atBoundary)
+	}
+
+	_, err = handler.Handle(makeConsumeRequest(t, "orders", 0, 3, 10))
+	if !errors.Is(err, consumer.ErrOffsetOutOfRange) {
+		t.Fatalf("offset beyond commit boundary error = %v, want ErrOffsetOutOfRange", err)
+	}
+}
+
+func TestConsumeHandlerRejectsInvalidCommittedBoundary(t *testing.T) {
+	_, handler := setupConsumeHandler(t)
+	handler.SetHighWatermarkLookup(func(string, uint32) (uint64, error) { return 4, nil })
+	_, err := handler.Handle(makeConsumeRequest(t, "orders", 0, 0, 10))
+	if err == nil {
+		t.Fatal("committed boundary beyond physical log end was accepted")
+	}
+}

@@ -40,6 +40,8 @@ spec:
               value: ":9092"
             - name: MESSLESSMQ_CLUSTER_ID
               value: messlessmq-kubernetes
+            - name: MESSLESSMQ_CONTROLLER_VOTERS
+              value: messlessmq-0,messlessmq-1,messlessmq-2
             - name: MESSLESSMQ_PEER_LISTEN_ADDRESS
               value: ":19093"
             - name: MESSLESSMQ_PEER_ADVERTISE_ADDRESS

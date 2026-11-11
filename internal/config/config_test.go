@@ -126,3 +126,46 @@ func TestReplicaAssignmentsRequireMembership(t *testing.T) {
 		t.Fatal("replica assignments without cluster membership should be rejected")
 	}
 }
+
+func TestLoadControllerVoterConfiguration(t *testing.T) {
+	values := map[string]string{
+		"MESSLESSMQ_BROKER_ID":              "broker-2",
+		"MESSLESSMQ_CLUSTER_ID":             "orders-cluster",
+		"MESSLESSMQ_PEER_LISTEN_ADDRESS":    ":19093",
+		"MESSLESSMQ_PEER_ADVERTISE_ADDRESS": "broker-2:19093",
+		"MESSLESSMQ_CONTROLLER_VOTERS":      "broker-1, broker-2,broker-3",
+		"MESSLESSMQ_ELECTION_TIMEOUT_MIN":   "800ms",
+		"MESSLESSMQ_ELECTION_TIMEOUT_MAX":   "1300ms",
+		"MESSLESSMQ_HEARTBEAT_INTERVAL":     "150ms",
+	}
+	cfg, err := Load(func(key string) (string, bool) { value, ok := values[key]; return value, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ControllerVoters) != 3 || cfg.ControllerVoters[1] != "broker-2" || cfg.ElectionTimeoutMin != 800*time.Millisecond || cfg.ElectionTimeoutMax != 1300*time.Millisecond || cfg.HeartbeatInterval != 150*time.Millisecond {
+		t.Fatalf("unexpected controller config: %+v", cfg)
+	}
+}
+
+func TestControllerVotersRequireFixedValidMembership(t *testing.T) {
+	cfg := Defaults()
+	cfg.BrokerID = "broker-1"
+	cfg.ControllerVoters = []string{"broker-1", "broker-2", "broker-3"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("controller voters without membership should be rejected")
+	}
+	cfg.ClusterID = "orders-cluster"
+	cfg.PeerListenAddress = ":19092"
+	cfg.PeerAdvertiseAddress = "broker-1:19092"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid controller voter config rejected: %v", err)
+	}
+	cfg.ControllerVoters = []string{"broker-1", "broker-1"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("duplicate controller voters should be rejected")
+	}
+	cfg.ControllerVoters = []string{"broker-2", "broker-3"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("controller voter config without self should be rejected")
+	}
+}

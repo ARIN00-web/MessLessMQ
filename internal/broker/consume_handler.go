@@ -2,6 +2,7 @@ package broker
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/ARIN00-web/messlessmq/internal/consumer"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
@@ -16,8 +17,12 @@ const (
 // ConsumeHandler serves stateless fetch requests against a registered topic.
 // The client supplies the next offset on every request; durable consumer-group
 // offsets are intentionally outside Phase 9.
+type HighWatermarkLookup func(topicName string, partitionID uint32) (uint64, error)
+
 type ConsumeHandler struct {
-	registry *topic.Registry
+	registry      *topic.Registry
+	mu            sync.RWMutex
+	highWatermark HighWatermarkLookup
 }
 
 // NewConsumeHandler creates a consume handler. When no registry is supplied,
@@ -29,6 +34,29 @@ func NewConsumeHandler(registries ...*topic.Registry) *ConsumeHandler {
 		registry = registries[0]
 	}
 	return &ConsumeHandler{registry: registry}
+}
+
+// SetHighWatermarkLookup restricts fetches to records below the persisted
+// exclusive commit boundary. Install it during broker construction before
+// serving requests. A nil lookup retains the standalone handler's historical
+// behaviour of exposing the local log end.
+func (h *ConsumeHandler) SetHighWatermarkLookup(lookup HighWatermarkLookup) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.highWatermark = lookup
+	h.mu.Unlock()
+}
+
+func (h *ConsumeHandler) committedEnd(topicName string, partitionID uint32, logEnd uint64) (uint64, error) {
+	h.mu.RLock()
+	lookup := h.highWatermark
+	h.mu.RUnlock()
+	if lookup == nil {
+		return logEnd, nil
+	}
+	return lookup(topicName, partitionID)
 }
 
 func (h *ConsumeHandler) Handle(req protocol.Request) ([]byte, error) {
@@ -57,6 +85,21 @@ func (h *ConsumeHandler) Handle(req protocol.Request) ([]byte, error) {
 		return nil, err
 	}
 
+	startOffset, physicalLogEnd, err := partition.OffsetRange()
+	if err != nil {
+		return nil, fmt.Errorf("read partition range: %w", err)
+	}
+	committedEnd, err := h.committedEnd(consumeReq.Topic, consumeReq.PartitionID, physicalLogEnd)
+	if err != nil {
+		return nil, fmt.Errorf("read committed boundary: %w", err)
+	}
+	if committedEnd < startOffset || committedEnd > physicalLogEnd {
+		return nil, fmt.Errorf("committed boundary %d outside local range [%d,%d)", committedEnd, startOffset, physicalLogEnd)
+	}
+	if consumeReq.Offset > committedEnd {
+		return nil, fmt.Errorf("requested offset %d exceeds committed end %d: %w", consumeReq.Offset, committedEnd, consumer.ErrOffsetOutOfRange)
+	}
+
 	reader, err := consumer.New(partition)
 	if err != nil {
 		return nil, fmt.Errorf("create request reader: %w", err)
@@ -78,6 +121,19 @@ func (h *ConsumeHandler) Handle(req protocol.Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The physical log may contain an uncommitted tail. Never expose those
+	// records or report the physical end offset to clients.
+	visible := result.Records[:0]
+	for _, record := range result.Records {
+		if record.Offset < committedEnd {
+			visible = append(visible, record)
+		}
+	}
+	result.Records = visible
+	if result.NextOffset > committedEnd {
+		result.NextOffset = committedEnd
+	}
+	result.LogEndOffset = committedEnd
 
 	response := protocol.ConsumeResponse{
 		StartOffset:  result.StartOffset,

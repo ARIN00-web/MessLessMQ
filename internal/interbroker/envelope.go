@@ -24,6 +24,7 @@ const (
 	MessageHeartbeat
 	MessageBrokerJoin
 	MessageReplicationStatus
+	MessageReplicationCommit
 )
 
 var (

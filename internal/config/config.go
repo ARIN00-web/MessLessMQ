@@ -34,6 +34,10 @@ type Config struct {
 	PeerJoinTimeout      time.Duration
 	ReplicaAssignments   string
 	MinISR               int
+	ControllerVoters     []string
+	ElectionTimeoutMin   time.Duration
+	ElectionTimeoutMax   time.Duration
+	HeartbeatInterval    time.Duration
 }
 
 func Defaults() Config {
@@ -43,6 +47,8 @@ func Defaults() Config {
 		MaxConnections: 10000, RequestTimeout: 10 * time.Second,
 		ShutdownTimeout: 30 * time.Second, RateLimitPerSecond: 1000,
 		RateLimitBurst: 2000, PeerJoinTimeout: 30 * time.Second, MinISR: 1,
+		ElectionTimeoutMin: 900 * time.Millisecond, ElectionTimeoutMax: 1500 * time.Millisecond,
+		HeartbeatInterval: 200 * time.Millisecond,
 	}
 }
 
@@ -79,6 +85,13 @@ func Load(getenv LookupEnv) (Config, error) {
 	readString("PEER_LISTEN_ADDRESS", &cfg.PeerListenAddress)
 	readString("PEER_ADVERTISE_ADDRESS", &cfg.PeerAdvertiseAddress)
 	readString("REPLICA_ASSIGNMENTS", &cfg.ReplicaAssignments)
+	if value, ok := getenv("MESSLESSMQ_CONTROLLER_VOTERS"); ok {
+		for _, voter := range strings.Split(value, ",") {
+			if voter = strings.TrimSpace(voter); voter != "" {
+				cfg.ControllerVoters = append(cfg.ControllerVoters, voter)
+			}
+		}
+	}
 	if value, ok := getenv("MESSLESSMQ_SEEDS"); ok {
 		for _, seed := range strings.Split(value, ",") {
 			if seed = strings.TrimSpace(seed); seed != "" {
@@ -105,6 +118,15 @@ func Load(getenv LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.PeerJoinTimeout, err = durationValue(getenv, "PEER_JOIN_TIMEOUT", cfg.PeerJoinTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ElectionTimeoutMin, err = durationValue(getenv, "ELECTION_TIMEOUT_MIN", cfg.ElectionTimeoutMin); err != nil {
+		return Config{}, err
+	}
+	if cfg.ElectionTimeoutMax, err = durationValue(getenv, "ELECTION_TIMEOUT_MAX", cfg.ElectionTimeoutMax); err != nil {
+		return Config{}, err
+	}
+	if cfg.HeartbeatInterval, err = durationValue(getenv, "HEARTBEAT_INTERVAL", cfg.HeartbeatInterval); err != nil {
 		return Config{}, err
 	}
 	if cfg.RateLimitPerSecond, err = floatValue(getenv, "RATE_LIMIT_PER_SECOND", cfg.RateLimitPerSecond); err != nil {
@@ -205,6 +227,37 @@ func (c Config) Validate() error {
 		problems = append(problems, "minimum in-sync replicas must be at least one")
 	}
 	peerConfigured := c.ClusterID != "" || c.PeerListenAddress != "" || c.PeerAdvertiseAddress != "" || len(c.SeedPeers) > 0
+	if len(c.ControllerVoters) > 0 {
+		if !peerConfigured {
+			problems = append(problems, "controller voters require cluster membership configuration")
+		}
+		seenVoters := make(map[string]struct{}, len(c.ControllerVoters))
+		selfFound := false
+		for _, voter := range c.ControllerVoters {
+			voter = strings.TrimSpace(voter)
+			if voter == "" || len(voter) > 128 {
+				problems = append(problems, "controller voter IDs must be non-empty and at most 128 characters")
+				continue
+			}
+			if _, exists := seenVoters[voter]; exists {
+				problems = append(problems, fmt.Sprintf("duplicate controller voter %q", voter))
+				continue
+			}
+			seenVoters[voter] = struct{}{}
+			if voter == c.BrokerID {
+				selfFound = true
+			}
+		}
+		if !selfFound {
+			problems = append(problems, "controller voter list must include this broker ID")
+		}
+		if c.ElectionTimeoutMin <= 0 || c.ElectionTimeoutMax <= c.ElectionTimeoutMin {
+			problems = append(problems, "controller election timeout max must exceed a positive min")
+		}
+		if c.HeartbeatInterval <= 0 || c.HeartbeatInterval*2 >= c.ElectionTimeoutMin {
+			problems = append(problems, "controller heartbeat interval must be positive and less than half the minimum election timeout")
+		}
+	}
 	if strings.TrimSpace(c.ReplicaAssignments) != "" && !peerConfigured {
 		problems = append(problems, "replica assignments require cluster membership configuration")
 	}

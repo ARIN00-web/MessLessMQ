@@ -105,6 +105,9 @@ func errorCodeFromError(err error) uint16 {
 	if errors.Is(err, protocol.ErrInsufficientISR) {
 		return protocol.ErrorInsufficientISR
 	}
+	if errors.Is(err, protocol.ErrCommitUncertain) {
+		return protocol.ErrorCommitUncertain
+	}
 	if errors.Is(err, topic.ErrTopicNotFound) {
 		return protocol.ErrorUnknownTopic
 	}

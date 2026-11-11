@@ -26,6 +26,7 @@ func TestErrorCodeFromError(t *testing.T) {
 		{name: "unsupported version", err: protocol.ErrUnsupportedVersion, want: protocol.ErrorUnsupportedVersion},
 		{name: "not partition leader", err: protocol.ErrNotPartitionLeader, want: protocol.ErrorNotPartitionLeader},
 		{name: "insufficient ISR", err: protocol.ErrInsufficientISR, want: protocol.ErrorInsufficientISR},
+		{name: "uncertain commit", err: protocol.ErrCommitUncertain, want: protocol.ErrorCommitUncertain},
 		{name: "internal error", err: errors.New("something went wrong"), want: protocol.ErrorInternal},
 	}
 	for _, tt := range tests {

@@ -226,3 +226,57 @@ func TestMuxCanServeMultiplePeerMessageTypes(t *testing.T) {
 		t.Fatalf("payload = %q", response.Payload)
 	}
 }
+
+func TestDurableControllerHandlerPersistsVoteBeforeReply(t *testing.T) {
+	directory := t.TempDir()
+	node, err := controller.OpenDurableNode("follower", []string{"candidate-a", "candidate-b"}, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewDurableControllerHandler(node, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(controller.VoteRequest{Term: 1, CandidateID: "candidate-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := handler.Handle(context.Background(), Envelope{
+		Type: MessageVoteRequest, RequestID: 1, SourceID: "candidate-a", TargetID: "follower", Payload: payload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vote controller.VoteResponse
+	if err := json.Unmarshal(response.Payload, &vote); err != nil {
+		t.Fatal(err)
+	}
+	if !vote.VoteGranted {
+		t.Fatalf("expected first vote to be granted: %+v", vote)
+	}
+
+	restarted, err := controller.OpenDurableNode("follower", []string{"candidate-a", "candidate-b"}, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHandler, err := NewDurableControllerHandler(restarted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPayload, err := json.Marshal(controller.VoteRequest{Term: 1, CandidateID: "candidate-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResponse, err := restartedHandler.Handle(context.Background(), Envelope{
+		Type: MessageVoteRequest, RequestID: 2, SourceID: "candidate-b", TargetID: "follower", Payload: secondPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(secondResponse.Payload, &vote); err != nil {
+		t.Fatal(err)
+	}
+	if vote.VoteGranted {
+		t.Fatal("durable follower granted two votes in one term")
+	}
+}

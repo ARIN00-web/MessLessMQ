@@ -131,15 +131,16 @@ type distributedAppender struct {
 	members     *membership.Registry
 	assignments map[partitionKey]partitionReplicaAssignment
 	minISR      int
+	commits     *replication.CommitStore
 	transport   *interbroker.Transport
 	requestID   atomic.Uint64
 	locksMu     sync.Mutex
 	locks       map[partitionKey]*sync.Mutex
 }
 
-func newDistributedAppender(brokerID string, members *membership.Registry, assignments map[partitionKey]partitionReplicaAssignment, minISR int) *distributedAppender {
+func newDistributedAppender(brokerID string, members *membership.Registry, assignments map[partitionKey]partitionReplicaAssignment, minISR int, commits *replication.CommitStore) *distributedAppender {
 	return &distributedAppender{
-		brokerID: brokerID, members: members, assignments: assignments, minISR: minISR,
+		brokerID: brokerID, members: members, assignments: assignments, minISR: minISR, commits: commits,
 		transport: interbroker.NewTransport(5 * time.Second), locks: make(map[partitionKey]*sync.Mutex),
 	}
 }
@@ -160,17 +161,17 @@ func (a *distributedAppender) Append(partition *topic.Partition, topicName strin
 		return 0, errors.New("distributed appender is not initialized")
 	}
 	key := partitionKey{Topic: topicName, PartitionID: partition.ID()}
-	assignment, exists := a.assignments[key]
-	if !exists {
-		return 0, fmt.Errorf("no replica assignment for %s:%d", topicName, partition.ID())
-	}
-	if assignment.LeaderID != a.brokerID {
+	assignment, assigned := a.assignments[key]
+	if assigned && assignment.LeaderID != a.brokerID {
 		return 0, fmt.Errorf("partition %s:%d leader is %s, this broker is %s: %w", topicName, partition.ID(), assignment.LeaderID, a.brokerID, protocol.ErrNotPartitionLeader)
 	}
 	lock := a.partitionLock(key)
 	lock.Lock()
 	defer lock.Unlock()
 
+	if !assigned {
+		return a.appendAndCommitLocally(partition, topicName, value, timestamp)
+	}
 	switch ack {
 	case protocol.AckNone:
 		return partition.AppendAt(value, timestamp)
@@ -183,12 +184,31 @@ func (a *distributedAppender) Append(partition *topic.Partition, topicName strin
 	}
 }
 
+func (a *distributedAppender) appendAndCommitLocally(partition *topic.Partition, topicName string, value []byte, timestamp int64) (uint64, error) {
+	offset, err := partition.AppendAtSync(value, timestamp)
+	if err != nil {
+		return offset, err
+	}
+	_, logEnd, err := partition.OffsetRange()
+	if err != nil {
+		return offset, err
+	}
+	state, ok := a.commits.Get(topicName, partition.ID())
+	if !ok {
+		return offset, replication.ErrInvalidCommitState
+	}
+	if _, err := a.commits.Advance(topicName, partition.ID(), logEnd, state.LeaderID, state.LeaderEpoch, logEnd); err != nil {
+		return offset, err
+	}
+	return offset, nil
+}
+
 func (a *distributedAppender) appendAndReplicate(partition *topic.Partition, assignment partitionReplicaAssignment, value []byte, timestamp int64) (uint64, error) {
 	offset, err := partition.AppendAtSync(value, timestamp)
 	if err != nil {
 		return offset, err
 	}
-	acknowledged := 1 // the leader's durable local append
+	acknowledgedFollowers := make([]string, 0, len(assignment.Replicas)-1)
 	var replicaErrors []error
 	for _, followerID := range assignment.Replicas {
 		if followerID == a.brokerID {
@@ -198,10 +218,36 @@ func (a *distributedAppender) appendAndReplicate(partition *topic.Partition, ass
 			replicaErrors = append(replicaErrors, fmt.Errorf("replica %s: %w", followerID, err))
 			continue
 		}
-		acknowledged++
+		acknowledgedFollowers = append(acknowledgedFollowers, followerID)
 	}
+	acknowledged := 1 + len(acknowledgedFollowers) // include the leader's durable append
 	if acknowledged < a.minISR {
 		return offset, errors.Join(append([]error{fmt.Errorf("acknowledged %d replicas, need %d: %w", acknowledged, a.minISR, protocol.ErrInsufficientISR)}, replicaErrors...)...)
+	}
+	_, logEnd, err := partition.OffsetRange()
+	if err != nil {
+		return offset, err
+	}
+	if _, err := a.commits.Advance(assignment.Topic, assignment.PartitionID, logEnd, assignment.LeaderID, assignment.LeaderEpoch, logEnd); err != nil {
+		return offset, fmt.Errorf("persist leader high watermark: %w", err)
+	}
+
+	// The leader's commit point is durable before followers are told to expose
+	// it. Require the same MinISR to persist the commit marker. If this fails,
+	// the append outcome is uncertain: the leader has committed locally, but
+	// the marker may have reached fewer than MinISR replicas.
+	commitAcks := 1
+	var commitErrors []error
+	for _, followerID := range acknowledgedFollowers {
+		if err := a.sendCommitMarker(assignment, followerID, logEnd); err != nil {
+			commitErrors = append(commitErrors, fmt.Errorf("commit marker to %s: %w", followerID, err))
+			continue
+		}
+		commitAcks++
+	}
+	if commitAcks < a.minISR {
+		base := fmt.Errorf("commit marker persisted on %d replicas, need %d: %w", commitAcks, a.minISR, protocol.ErrCommitUncertain)
+		return offset, errors.Join(append([]error{base}, commitErrors...)...)
 	}
 	return offset, nil
 }
@@ -212,9 +258,19 @@ type replicationStatusRequest struct {
 }
 
 type replicationStatusResponse struct {
-	BrokerID    string `json:"broker_id"`
-	StartOffset uint64 `json:"start_offset"`
-	NextOffset  uint64 `json:"next_offset"`
+	BrokerID      string `json:"broker_id"`
+	StartOffset   uint64 `json:"start_offset"`
+	NextOffset    uint64 `json:"next_offset"`
+	HighWatermark uint64 `json:"high_watermark"`
+	LeaderEpoch   uint64 `json:"leader_epoch"`
+}
+
+type replicationCommitRequest struct {
+	Topic         string `json:"topic"`
+	PartitionID   uint32 `json:"partition_id"`
+	LeaderID      string `json:"leader_id"`
+	LeaderEpoch   uint64 `json:"leader_epoch"`
+	HighWatermark uint64 `json:"high_watermark"`
 }
 
 func (a *distributedAppender) replicateFollower(partition *topic.Partition, assignment partitionReplicaAssignment, followerID string) error {
@@ -249,6 +305,16 @@ func (a *distributedAppender) replicateFollower(partition *topic.Partition, assi
 	if status.BrokerID != followerID {
 		return fmt.Errorf("follower status identifies %q, expected %q", status.BrokerID, followerID)
 	}
+	if status.LeaderEpoch != assignment.LeaderEpoch {
+		return replication.ErrStaleLeaderEpoch
+	}
+	leaderCommit, exists := a.commits.Get(assignment.Topic, assignment.PartitionID)
+	if !exists {
+		return replication.ErrInvalidCommitState
+	}
+	if status.HighWatermark > leaderCommit.HighWatermark {
+		return replication.ErrFollowerCommitAhead
+	}
 	if status.StartOffset > leaderStart || status.NextOffset < leaderStart {
 		return replication.ErrReplicaBehindRetention
 	}
@@ -277,6 +343,41 @@ func (a *distributedAppender) replicateFollower(partition *topic.Partition, assi
 			return err
 		}
 		from = next
+	}
+	return nil
+}
+
+func (a *distributedAppender) sendCommitMarker(assignment partitionReplicaAssignment, followerID string, highWatermark uint64) error {
+	if a.members == nil {
+		return membership.ErrUnknownPeer
+	}
+	follower, ok := a.members.Broker(followerID)
+	if !ok {
+		return fmt.Errorf("broker %s is not currently discovered: %w", followerID, membership.ErrUnknownPeer)
+	}
+	payload, err := json.Marshal(replicationCommitRequest{
+		Topic: assignment.Topic, PartitionID: assignment.PartitionID,
+		LeaderID: assignment.LeaderID, LeaderEpoch: assignment.LeaderEpoch,
+		HighWatermark: highWatermark,
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := a.transport.RoundTrip(ctx, follower.PeerAddress, interbroker.Envelope{
+		Type: interbroker.MessageReplicationCommit, RequestID: a.requestID.Add(1),
+		SourceID: a.brokerID, TargetID: followerID, Payload: payload,
+	})
+	if err != nil {
+		return err
+	}
+	var ack replicationStatusResponse
+	if err := json.Unmarshal(response.Payload, &ack); err != nil {
+		return fmt.Errorf("decode commit acknowledgement: %w", err)
+	}
+	if ack.BrokerID != followerID || ack.HighWatermark < highWatermark || ack.LeaderEpoch != assignment.LeaderEpoch {
+		return fmt.Errorf("follower %s commit acknowledgement is stale or incomplete: %+v", followerID, ack)
 	}
 	return nil
 }
@@ -341,13 +442,14 @@ type replicationPeerHandler struct {
 	members     *membership.Registry
 	registry    *topic.Registry
 	assignments map[partitionKey]partitionReplicaAssignment
+	commits     *replication.CommitStore
 }
 
-func newReplicationPeerHandler(brokerID string, members *membership.Registry, registry *topic.Registry, assignments map[partitionKey]partitionReplicaAssignment) (*replicationPeerHandler, error) {
-	if brokerID == "" || members == nil || registry == nil || len(assignments) == 0 {
-		return nil, errors.New("replication peer handler requires broker identity, membership and assignments")
+func newReplicationPeerHandler(brokerID string, members *membership.Registry, registry *topic.Registry, assignments map[partitionKey]partitionReplicaAssignment, commits *replication.CommitStore) (*replicationPeerHandler, error) {
+	if brokerID == "" || members == nil || registry == nil || len(assignments) == 0 || commits == nil {
+		return nil, errors.New("replication peer handler requires broker identity, membership, assignments and commit store")
 	}
-	return &replicationPeerHandler{brokerID: brokerID, members: members, registry: registry, assignments: assignments}, nil
+	return &replicationPeerHandler{brokerID: brokerID, members: members, registry: registry, assignments: assignments, commits: commits}, nil
 }
 
 func (h *replicationPeerHandler) validatePeer(sourceID, targetID string, assignment partitionReplicaAssignment) error {
@@ -405,7 +507,11 @@ func (h *replicationPeerHandler) Handle(ctx context.Context, request interbroker
 		if err != nil {
 			return interbroker.Envelope{}, err
 		}
-		payload, err := json.Marshal(replicationStatusResponse{BrokerID: h.brokerID, StartOffset: start, NextOffset: next})
+		commitState, exists := h.commits.Get(key.Topic, key.PartitionID)
+		if !exists {
+			return interbroker.Envelope{}, replication.ErrInvalidCommitState
+		}
+		payload, err := json.Marshal(replicationStatusResponse{BrokerID: h.brokerID, StartOffset: start, NextOffset: next, HighWatermark: commitState.HighWatermark, LeaderEpoch: commitState.LeaderEpoch})
 		if err != nil {
 			return interbroker.Envelope{}, err
 		}
@@ -442,6 +548,47 @@ func (h *replicationPeerHandler) Handle(ctx context.Context, request interbroker
 			return interbroker.Envelope{}, err
 		}
 		payload, err := json.Marshal(replicationStatusResponse{BrokerID: h.brokerID, StartOffset: start, NextOffset: next})
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		return interbroker.Envelope{Payload: payload}, nil
+	case interbroker.MessageReplicationCommit:
+		var commitRequest replicationCommitRequest
+		if err := json.Unmarshal(request.Payload, &commitRequest); err != nil || commitRequest.Topic == "" || commitRequest.LeaderID == "" || commitRequest.LeaderEpoch == 0 {
+			return interbroker.Envelope{}, replication.ErrInvalidCommitState
+		}
+		key := partitionKey{Topic: commitRequest.Topic, PartitionID: commitRequest.PartitionID}
+		assignment, ok := h.assignments[key]
+		if !ok {
+			return interbroker.Envelope{}, fmt.Errorf("no replica assignment for %s:%d", key.Topic, key.PartitionID)
+		}
+		if err := h.validatePeer(request.SourceID, request.TargetID, assignment); err != nil {
+			return interbroker.Envelope{}, err
+		}
+		if commitRequest.LeaderID != assignment.LeaderID || commitRequest.LeaderEpoch != assignment.LeaderEpoch {
+			return interbroker.Envelope{}, replication.ErrStaleLeaderEpoch
+		}
+		registeredTopic, err := h.registry.Get(key.Topic)
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		partition, err := registeredTopic.Partition(key.PartitionID)
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		_, logEnd, err := partition.OffsetRange()
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		state, err := h.commits.Advance(key.Topic, key.PartitionID, commitRequest.HighWatermark, commitRequest.LeaderID, commitRequest.LeaderEpoch, logEnd)
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		startOffset, _, err := partition.OffsetRange()
+		if err != nil {
+			return interbroker.Envelope{}, err
+		}
+		payload, err := json.Marshal(replicationStatusResponse{BrokerID: h.brokerID, StartOffset: startOffset, NextOffset: logEnd, HighWatermark: state.HighWatermark, LeaderEpoch: state.LeaderEpoch})
 		if err != nil {
 			return interbroker.Envelope{}, err
 		}

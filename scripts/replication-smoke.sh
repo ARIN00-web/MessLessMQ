@@ -139,13 +139,36 @@ for index in 1 2; do
   echo "broker-$((index + 1)) has the replicated record: $output"
 done
 
+# An acks=leader append is durable on the leader but remains uncommitted in a
+# replicated partition until a later MinISR replication quorum commits it.
+output="$($CLIENT_BIN produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value leader-only-pending -acks leader)"
+grep -Fq 'offset=1' <<<"$output"
+leader_pending="$($CLIENT_BIN consume -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -partition 0 -offset 1 -max 10)"
+grep -Fq 'next_offset=1 log_end_offset=1' <<<"$leader_pending"
+if grep -Fq 'leader-only-pending' <<<"$leader_pending"; then
+  echo "leader exposed an uncommitted record" >&2
+  exit 1
+fi
+follower_pending="$($CLIENT_BIN consume -addr "127.0.0.1:${CLIENT_PORTS[1]}" -topic orders -partition 0 -offset 1 -max 10)"
+grep -Fq 'next_offset=1 log_end_offset=1' <<<"$follower_pending"
+echo "Uncommitted leader tail is hidden from leader and follower consumers."
+
+# The next acks=all operation catches the followers up through the preceding
+# leader-only append and commits the full prefix with a durable commit marker.
+output="$($CLIENT_BIN produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value commit-barrier -acks all)"
+grep -Fq 'offset=2' <<<"$output"
+follower_committed="$($CLIENT_BIN consume -addr "127.0.0.1:${CLIENT_PORTS[1]}" -topic orders -partition 0 -offset 1 -max 10)"
+grep -Fq 'value="leader-only-pending"' <<<"$follower_committed"
+grep -Fq 'value="commit-barrier"' <<<"$follower_committed"
+echo "Followers expose records only after the durable commit marker arrives."
+
 # With MinISR=2, one follower may be unavailable as long as the leader and
 # one follower durably acknowledge the record.
 kill -TERM "${PIDS[2]}"
 wait "${PIDS[2]}" || true
-output="$("$CLIENT_BIN" produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value min-isr-two-survived -acks all)"
-grep -Fq 'offset=1' <<<"$output"
-follower_output="$("$CLIENT_BIN" consume -addr "127.0.0.1:${CLIENT_PORTS[1]}" -topic orders -partition 0 -offset 1 -max 10)"
+output="$($CLIENT_BIN produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value min-isr-two-survived -acks all)"
+grep -Fq 'offset=3' <<<"$output"
+follower_output="$($CLIENT_BIN consume -addr "127.0.0.1:${CLIENT_PORTS[1]}" -topic orders -partition 0 -offset 3 -max 10)"
 grep -Fq 'value="min-isr-two-survived"' <<<"$follower_output"
 echo "MinISR=2 accepted the append with one follower unavailable."
 
@@ -154,13 +177,19 @@ echo "MinISR=2 accepted the append with one follower unavailable."
 kill -TERM "${PIDS[1]}"
 wait "${PIDS[1]}" || true
 set +e
-rejected_output="$("$CLIENT_BIN" produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value should-not-be-acked -acks all 2>&1)"
+rejected_output="$($CLIENT_BIN produce -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -key customer-7 -value should-not-be-acked -acks all 2>&1)"
 rejected_status=$?
 set -e
 if (( rejected_status == 0 )) || ! grep -Fq 'error code 14' <<<"$rejected_output"; then
   echo "expected insufficient-ISR rejection, got status=$rejected_status output=$rejected_output" >&2
   exit 1
 fi
-echo "MinISR=2 correctly rejected an append when both followers were unavailable."
+leader_tail="$($CLIENT_BIN consume -addr "127.0.0.1:${CLIENT_PORTS[0]}" -topic orders -partition 0 -offset 4 -max 10)"
+grep -Fq 'next_offset=4 log_end_offset=4' <<<"$leader_tail"
+if grep -Fq 'should-not-be-acked' <<<"$leader_tail"; then
+  echo "leader exposed a record that did not reach MinISR" >&2
+  exit 1
+fi
+echo "MinISR=2 correctly rejected the append when both followers were unavailable, and the uncommitted record remained hidden."
 
 echo "Three-process synchronous replication and MinISR smoke test passed."

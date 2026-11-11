@@ -60,6 +60,7 @@ type CommandType uint8
 const (
 	CommandRegisterBroker CommandType = iota + 1
 	CommandAssignPartition
+	CommandNoop
 )
 
 type Command struct {

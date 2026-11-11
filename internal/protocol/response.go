@@ -16,6 +16,7 @@ const (
 	ErrorRateLimited        uint16 = 12
 	ErrorNotPartitionLeader uint16 = 13
 	ErrorInsufficientISR    uint16 = 14
+	ErrorCommitUncertain    uint16 = 15
 )
 
 type Response struct {

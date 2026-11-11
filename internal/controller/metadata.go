@@ -83,6 +83,8 @@ func validateCommandShape(command Command) error {
 		if !leaderFound {
 			return ErrLeaderNotInReplicas
 		}
+	case CommandNoop:
+		return nil
 	default:
 		return ErrInvalidCommand
 	}
@@ -124,6 +126,8 @@ func (m *metadataState) apply(command Command) error {
 		a := command.Assignment
 		a.Replicas = append([]string(nil), a.Replicas...)
 		m.partitions[a.Key] = a
+	case CommandNoop:
+		return nil
 	}
 	m.version++
 	return nil

@@ -1,104 +1,103 @@
 # MessLessMQ — Final Architecture Review
 
-## 1. What is now integrated into the broker executable
+## 1. What is integrated into the broker executable
 
-The current `cmd/broker` entrypoint loads validated environment configuration, parses bootstrap topics, creates a structured logger, constructs `internal/server.Server`, and runs it with SIGINT/SIGTERM cancellation.
+The `cmd/broker` entrypoint loads validated environment configuration, opens a durable topic catalog and partition logs, creates the shared dispatcher, and serves the versioned binary protocol. With peer configuration enabled, it also starts a separate inter-broker listener, seed membership discovery, static replication handlers, and (when fixed voters are configured) a durable controller election runtime.
 
-The runtime composes these pieces for a **single standalone broker**:
+The current runtime includes:
 
-- A TCP listener and the existing length-prefixed binary request protocol.
-- A shared topic registry opened from a durable topic catalog at `<MESSLESSMQ_DATA_DIR>/metadata/topics.json`.
-- One append-only partition log per configured topic partition under `<MESSLESSMQ_DATA_DIR>/logs`.
-- PRODUCE API v1 with partition routing, persisted message keys, and `none`, `leader`, and `all` acknowledgement modes.
-- CONSUME API v1 for the original value-only response and API v2 for key/value records.
-- METADATA API v1 that advertises the local broker and partition set; when membership discovery is enabled, the broker list includes known peer addresses, while partition ownership remains local.
-- Configured connection limits, request deadlines, IP-based token-bucket admission control, and request metrics.
-- Optional TLS/mTLS on the client listener when certificate configuration is supplied.
-- Optional HTTP health, readiness, diagnostics, and metrics endpoints when `MESSLESSMQ_ADMIN_ADDRESS` is configured.
-- Graceful drain of in-flight operations followed by partition-log close.
-- Optional seed-based broker membership discovery over a separate inter-broker TCP listener, plus a private admin `GET /cluster/members` endpoint.
-- Persistent cluster/broker identity pinning at `<DATA_DIR>/metadata/identity.json` whenever peer membership is enabled.
+- TCP client listener with length-prefixed binary framing and request deadlines.
+- Persistent topic/partition catalog and append-only partition logs.
+- PRODUCE API v1 with deterministic key routing, message key persistence, and `none`, `leader`, and `all` acknowledgement modes.
+- CONSUME API v1 and v2; v2 returns key/value, timestamp, partition, and offsets. Reads are limited by the local persisted exclusive high watermark.
+- METADATA API v1 with known broker addresses and statically configured partition replica/leader assignments.
+- Optional TLS/mTLS on the client listener, connection limits, IP-based rate limiting, metrics, health, and diagnostics.
+- Graceful operation drain and partition-log close.
+- Seed-based broker membership over a peer TCP listener, with durable cluster/broker identity pinning.
+- Synchronous inter-process record replication and commit-marker propagation for static ordered replica assignments.
+- Persistent per-partition high watermarks in `<DATA_DIR>/metadata/commits/`.
+- A durable fixed-voter Raft controller participant in each configured broker process. Term, vote, log entries, and commit index are persisted under `<DATA_DIR>/metadata/controller/raft-state.json`.
 
-The runtime integration test starts a real TCP listener, produces a keyed record with a synchronous leader acknowledgement, consumes it, retrieves metadata, stops the server, reconstructs it from the same data directory, and consumes the record again.
+The runtime integration test covers TCP produce, consume, metadata, and local restart recovery. The replication smoke test starts three OS processes with independent data directories, verifies follower record copies, checks committed-read filtering, and tests MinISR behavior. The controller election smoke test verifies one elected controller leader, replacement election after that process stops, and restart of the former leader as a follower using its persisted state.
 
-## 2. Runtime topology versus distributed topology
+## 2. Current distributed behavior
 
-MessLessMQ now has a functioning **single-broker runtime**. The repository also contains separate educational implementations of a controller, cluster metadata model, replication manager, inter-broker TCP transport, reassignment/recovery coordinators, consumer groups, and offset store.
+### Membership
 
-Some broker-to-broker discovery is now wired into a multi-process control-plane edge, but the distributed packages are not yet assembled into one authoritative control/data plane. In particular:
+Brokers join configured seeds and exchange in-memory membership snapshots. Broker identity is pinned to a cluster ID and broker ID on disk. There is no heartbeat/lease-based membership failure detector, removal protocol, or consensus-committed membership view. Peer RPCs are plaintext and unauthenticated.
 
-- Brokers can join one another through configured seed peers and exchange in-memory membership snapshots. This is discovery only; there is no heartbeat/lease failure detector, membership removal protocol, or durable membership consensus.
-- The runtime's metadata handler can advertise discovered brokers, but partition metadata still describes only the local broker and local partitions; it does not read committed metadata from a distributed controller.
-- The runtime's replication manager is not connected to remote broker processes through `internal/interbroker`.
-- The controller's Raft-style cluster is still an in-memory simulation, not a durable three-node consensus service.
-- The broker does not register itself with an authoritative controller or receive committed partition assignments.
-- The client router is a package-level metadata cache; the CLI currently connects to the address supplied by the user and does not automatically route requests to a partition leader.
-- Consumer group membership, group coordination, and committed-offset APIs are not exposed end-to-end through the public broker TCP request pipeline. The current CLI consume operation is an explicit stateless partition/offset fetch.
+### Data replication
 
-Therefore the three Docker Compose services and three Kubernetes StatefulSet pods can now discover one another and expose a common configured cluster ID, but they are still **three independently operating standalone data brokers**, not a replicated three-broker cluster. They have distinct broker identities, data directories, and durable volumes. Membership does not replicate records between them or fail over partition leadership.
+The live runtime replicates record batches and commit markers over `internal/interbroker`. Replica assignments are static environment configuration; each ordered assignment's first broker is the fixed leader. `acks=all` requires MinISR durable data acknowledgements, persists the leader high watermark, then requires MinISR commit-marker acknowledgements. Consume hides offsets greater than or equal to the local persisted high watermark. The in-process `replication.Manager` is not instantiated across processes; the running server uses a separate transport adapter.
 
-## 3. Storage and message-format behavior
+A failed data quorum can leave uncommitted physical log tails. They are hidden from consumers, but automatic truncation/reconciliation is not implemented. An error 15 commit-marker quorum failure is an uncertain producer outcome because the leader watermark has already been persisted.
 
-The runtime persists its topic/partition catalog atomically in `metadata/topics.json`. It opens each configured partition log on startup and relies on the storage engine's existing segment recovery.
+### Controller election
 
-New PRODUCE requests store key and value together in the `MLMQMSG1` envelope, which includes a CRC32 checksum. CONSUME API v2 unwraps this envelope and returns both fields. API v1 remains compatible with the older value-only response layout. Legacy raw log records are returned as values with a nil key.
+The running broker can participate in a fixed-voter Raft controller election over the peer TCP transport. The voter list is explicit and identical across members. Elections use randomized timeouts and majority voting; leaders send AppendEntries heartbeats. Each controller persists term, vote, log, and commit index. On restart, role and leader identity are discarded and the voter rejoins as a follower. A three-process smoke test kills the elected controller leader, observes a replacement leader, restarts the old process from its original data directory, and verifies that it rejoins as a follower.
 
-The catalog is persistent, but topic creation/deletion and partition-count changes are not exposed as a live administrative API. A persisted topic's partition count is treated as immutable at startup; a mismatch in bootstrap configuration is rejected.
+This is currently **controller election and heartbeat durability**, not a complete controller-driven cluster metadata service. The server does not yet expose a proposal path for broker registration or partition assignment commands, and the runtime does not apply committed controller metadata to partition assignments. The controller leader is distinct from a partition leader. Controller election does not yet promote a new data-partition leader when the statically configured partition leader dies.
 
-A produce batch is not transactional. The handler validates the routing plan before the first append, but a disk error partway through a multi-record batch can leave earlier records appended. `acks=leader` synchronizes the local partition log before acknowledging. In this standalone runtime, `acks=all` is also a local durable acknowledgement because the local broker is the entire replica set; it is **not** a distributed ISR quorum acknowledgement.
+### Client and consumer APIs
 
-## 4. Security and operations integration
+The client router remains a package-level metadata cache; the CLI connects to the broker address supplied by the user and does not automatically route to partition leaders. Consumer group membership, group coordination, and committed consumer-offset APIs are not exposed end-to-end through the public TCP protocol. The CLI consume operation is an explicit stateless partition/offset fetch.
 
-- TLS and optional mutual TLS can be enabled on the live broker listener through the environment configuration.
-- Request rate limiting is active in the runtime and currently keys clients by remote IP address.
-- API-key authentication and ACL authorization packages exist but are not wired into the custom binary TCP request path.
-- The CLI currently supports plaintext TCP only; it has no TLS flags or client certificate loading.
-- The optional HTTP admin endpoints are not authenticated by this runtime. Bind `MESSLESSMQ_ADMIN_ADDRESS` only to loopback or a trusted private management network. Do not expose it publicly.
-- Metrics count requests, errors, produced messages, consume requests, and dispatch latency. Health checks inspect local partition-log offset access.
-- Graceful shutdown stops accepting new connections, drains operations until the configured timeout, closes remaining client sockets, and closes topic logs.
+## 3. Storage and message format
+
+The topic/partition catalog is persisted under `metadata/topics.json`; partition logs are stored below `logs/`. Runtime-produced records wrap key/value data in the CRC32-checked `MLMQMSG1` envelope. CONSUME v2 unwraps the envelope; API v1 remains compatible with the original value-only response. Legacy raw records are returned as values with nil keys.
+
+The catalog is persistent, but topic create/delete and partition-count changes are not exposed as a live administrative API. A persisted topic's partition count is immutable at startup; a conflicting bootstrap definition is rejected.
+
+A produce batch is not transactional. A disk error partway through a multi-record batch can leave earlier records appended. In replicated mode, `acks=leader` syncs only the leader log and leaves the tail uncommitted; a later successful `acks=all` may replicate and commit that contiguous prefix. Error 14 means data quorum was not reached and the leader watermark was not advanced. Error 15 means the leader watermark was persisted but commit-marker quorum confirmation is uncertain.
+
+## 4. Security and operations
+
+- TLS/mTLS can protect the client broker listener when configured. The inter-broker peer listener is currently plaintext and unauthenticated.
+- Request rate limiting is active and keyed by remote IP, not authenticated principal.
+- API-key authentication and ACL authorization packages are not wired into the live custom TCP request path.
+- The CLI supports plaintext TCP only.
+- HTTP admin endpoints are unauthenticated; bind `MESSLESSMQ_ADMIN_ADDRESS` only to loopback or a trusted private management network.
+- Metrics expose request/error/produce/consume and latency observations. Health checks inspect local partition-log access.
+- Graceful shutdown stops accepting new operations, drains in-flight work until the configured deadline, and closes topic logs.
 
 ## 5. Deployment assets
 
-- The Docker image runs as a non-root user and writes data below `/var/lib/messlessmq`.
-- Compose and Kubernetes configure one shared cluster ID, unique broker IDs, peer listeners, advertised peer addresses, and seed discovery. The Kubernetes bootstrap pod lists itself as a self seed, which the startup join logic ignores.
-- Each peer-enabled data directory stores a durable cluster/broker identity in `metadata/identity.json`; changing either identity while reusing that data directory is rejected.
-- Compose assigns a distinct named volume to each standalone broker.
-- The Kubernetes StatefulSet uses stable pod identities and one persistent volume claim per pod. A working StorageClass/provisioner is required for PVC binding.
-- The Kubernetes TCP probes only prove that the process accepts a TCP connection; they do not establish replication health or quorum readiness.
+- Docker image runs as a non-root user and writes below `/var/lib/messlessmq`.
+- Compose and Kubernetes configure one cluster ID, unique broker IDs, peer listeners, advertised peer addresses, seed discovery, and a fixed three-voter controller set.
+- Each broker has a distinct durable volume/PVC for logs, commit state, identity, and controller Raft state.
+- Default deployment manifests **do not** set `MESSLESSMQ_REPLICA_ASSIGNMENTS`; they run membership and controller election, but message replication is enabled only after identical static replica assignments and MinISR are configured on all brokers.
+- Kubernetes TCP probes only show that the process accepts a connection; they do not establish data replication health, commit convergence, or controller quorum readiness.
 
-Persistent volumes protect local broker files against pod replacement where the storage provider honors the PVC. They do not make one broker's local records replicated or available from another broker.
+Persistent volumes protect each broker's local state where the storage provider honors the PVC. Static assignments enable synchronous record and commit-marker replication. The controller can elect a leader, but it cannot yet update assignments or promote partition leaders.
 
-## 6. Strengths retained from the educational phases
+## 6. Strong engineering aspects
 
-- Explicit TCP message framing rather than assuming TCP preserves message boundaries.
-- Versioned binary protocol APIs and correlation IDs.
-- Append-only segmented storage, offset/time indexes, retention, and startup recovery.
-- Explicit producer acknowledgement modes and partition routing.
-- Persistent message keys and CRC32 validation for runtime-produced records.
-- Consumer replay and explicit offsets; standalone durable offset-store package.
-- Separate replication and controller-quorum concepts, including ISR/high-watermark and term/commit-index models.
-- Race-tested package implementations and repeatable unit/integration commands.
+- Explicit TCP framing and versioned binary APIs.
+- Append-only segmented storage, indexes, retention, and startup recovery.
+- Persistent keyed records and CRC32 envelope validation.
+- Explicit acknowledgements, static replica replication, MinISR, and committed-read boundaries.
+- Durable controller term/vote/log/commit state and real multi-process fixed-voter elections.
+- Separate modeling of controller quorum and data replication quorum.
+- Race-tested packages and repeatable multi-process smoke scripts.
 
-## 7. Remaining work before claiming a distributed production broker
+## 7. Remaining work before a distributed production release
 
-1. Add authenticated/TLS-protected peer communication and heartbeat/lease-based membership health and removal; the current join protocol is plaintext and unauthenticated.
-2. Persist controller current term, vote, log, commit index, and applied metadata; recover them before elections.
-3. Run a controller quorum across separate processes and carry RequestVote/AppendEntries over authenticated, TLS-protected peer connections.
-4. Connect remote replication batches to the inter-broker transport, including bounded retry, timeout, epoch fencing, follower truncation, and catch-up.
-5. Make partition placement authoritative and provision the correct local replica logs on each broker.
-6. Route produce/fetch requests to partition leaders using refreshed cluster metadata.
+1. Add authentication and TLS to inter-broker traffic, plus heartbeat/lease membership health and removal.
+2. Add a live controller proposal API for broker registration and partition assignments; replicate and commit those commands through the Raft log.
+3. Apply committed metadata on every broker and make it authoritative for replica assignments and leader epochs.
+4. Implement Raft per-peer replication progress/backtracking, current-term commit rules for actual metadata proposals, quorum-loss tests, and safe voter reconfiguration.
+5. Connect controller decisions to partition leader promotion, dynamic ISR removal, replica reassignment, catch-up, and safe old-leader fencing.
+6. Route produce/fetch clients to leaders using refreshed committed cluster metadata.
 7. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
-8. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a secure TLS-capable client.
-9. Define batch retry/idempotency semantics across partial appends and server restarts.
-10. Add replicated end-to-end tests for produce, follower failure, leader election, catch-up, consumer failover, and controller quorum loss.
+8. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a TLS-capable client.
+9. Define idempotency/retry semantics across partial appends, uncertain commit outcomes, and server restarts.
+10. Add multi-process data-plane failover tests: kill a partition leader, continue writes/reads through a promoted replica, restart the former leader, and verify catch-up.
 11. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
 
-## 8. Delivery semantics caution
+## 8. Delivery-semantics caution
 
-The codebase includes at-most-once, at-least-once, idempotent-producer, duplicate-detection, and local effect-ledger models. The current runtime's simple PRODUCE API does not yet expose the complete idempotent producer/session lifecycle. It should not be described as a general exactly-once transaction system. Exactly-once side effects require the destination to participate in a transaction or provide idempotency/deduplication semantics.
+The codebase contains at-most-once, at-least-once, idempotent-producer, duplicate-detection, and local effect-ledger models. The runtime PRODUCE API does not expose a complete idempotent producer/session lifecycle. Do not describe it as a general exactly-once transaction system. Exactly-once external side effects require the destination to participate in a transaction or provide its own idempotency/deduplication semantics.
 
 ## 9. Final assessment
 
-MessLessMQ now has a usable, persistent, single-broker TCP runtime with produce, consume, local metadata, startup recovery, optional listener TLS/mTLS, operational instrumentation, and a CLI. The repository also contains tested educational implementations of many distributed-system components.
-
-It is appropriate to present as a from-scratch message broker project with a functioning single-node data path and an in-progress distributed control/replication architecture. It is **not yet an autonomous replicated three-broker service or a production-ready Kafka replacement**. The next engineering milestone is to make controller quorum, broker registration, remote replication, leader routing, and failover work across real broker processes.
+MessLessMQ has a persistent broker runtime, real inter-process synchronous record replication with durable commit markers under static assignments, and real fixed-voter controller elections with durable term/vote/log/commit state. It is not yet an autonomous distributed broker: controller metadata proposals do not drive partition assignments, and controller failover does not yet trigger data-partition leader promotion or client rerouting. It should not be presented as a production-ready Kafka replacement until those integration and security gaps are closed and tested end to end.

@@ -1,30 +1,33 @@
 # MessLessMQ — Production & Distributed Test Plan
 
-This plan distinguishes the currently integrated single-broker runtime from the distributed components that still need multi-process wiring.
+This plan distinguishes package tests, the persistent broker runtime, static multi-process data replication, and fixed-voter controller elections from the remaining controller-driven partition failover work.
 
 ## Test layers
 
 | Layer | Command / asset | What it establishes | What it does not establish |
 |---|---|---|---|
 | Unit | `go test ./...` | Package behavior and regressions | Real multi-process behavior by itself |
-| Race | `go test -race ./...` | Data races exercised by the test suite | Absence of every possible race under every workload |
-| Runtime integration | `go test ./internal/server` | Real TCP produce, consume, local metadata, log persistence and restart recovery in one broker process | Remote replication or controller consensus |
-| Integration | `scripts/integration.sh` | Runtime, request, protocol, cluster, inter-broker, consumer, group, and offset package integration tests | A functioning multi-broker cluster |
-| Data integrity | `scripts/data-integrity.sh` | Storage, replication, offsets, delivery, record metadata, and recovery suites | End-to-end replica durability across actual broker processes |
-| Microbenchmark | `scripts/benchmark.sh` | Relative CPU/allocation costs of performance primitives | End-to-end broker throughput or production latency |
-| Single-broker crash recovery | `scripts/crash-restart.sh` | A synchronously acknowledged keyed message remains readable after SIGKILL and restart using the same data directory; SIGTERM path exits | Replica recovery or failover |
-| Docker Compose | `deploy/docker-compose.yml` | Three standalone broker processes with separate named persistent volumes | Replication, election, shared metadata, or routing |
-| Kubernetes | `deploy/kubernetes/` | Three StatefulSet pods with stable identities and per-pod PVCs, subject to a working StorageClass | Replication, election, shared metadata, or routing |
+| Race | `go test -race ./...` | Data races exercised by the suite | Absence of every possible race under every workload |
+| Runtime integration | `go test ./internal/server` | Real TCP produce, consume, metadata, local log persistence and restart recovery | Remote replication or controller elections |
+| Integration | `scripts/integration.sh` | Runtime, request, protocol, cluster, peer, consumer, group, and offset package tests | Full autonomous cluster behavior |
+| Membership | `scripts/membership-smoke.sh` | Three broker processes converge on a shared discovered membership view | Liveness-based membership removal or consensus membership |
+| Replication/commit | `scripts/replication-smoke.sh` | Real record copies to followers, durable commit markers, committed-read filtering, and MinISR behavior | Dynamic leader election or automatic replica reassignment |
+| Controller election | `scripts/controller-election-smoke.sh` | Three broker processes elect one controller leader, elect a replacement after its process stops, and restart the old voter from durable state as a follower | Controller metadata proposals or partition leader promotion |
+| Data integrity | `scripts/data-integrity.sh` | Storage, replication, offsets, delivery, record metadata, and recovery suites | All possible multi-process data corruption scenarios |
+| Microbenchmark | `scripts/benchmark.sh` | Relative CPU/allocation cost of performance primitives | End-to-end broker throughput or production latency |
+| Single-broker crash recovery | `scripts/crash-restart.sh` | Synchronously acknowledged local record remains readable after SIGKILL/restart on same data directory | Replica recovery or leader failover |
+| Docker Compose | `deploy/docker-compose.yml` | Three broker processes, membership, fixed-voter controller elections, separate named volumes | Replication unless static replica assignments are added; controller-driven partition changes |
+| Kubernetes | `deploy/kubernetes/` | Three StatefulSet pods with stable identities and per-pod PVCs, subject to a working StorageClass | Data replication unless assignments are configured; partition failover or routing |
 
 ## Repeatable local validation
 
-Run `scripts/validate.sh` for the full tests, race detector, command builds, and `go vet`.
+Run `scripts/validate.sh` for full tests, race detection, command builds, and `go vet`.
 
-Run `scripts/integration.sh` for the runtime TCP test and the adjacent network/protocol/consumer packages.
+Run `scripts/membership-smoke.sh` to exercise broker discovery across three processes. Run `scripts/replication-smoke.sh` to exercise synchronous static-assignment replication, durable commit markers, committed-read filtering, and MinISR behavior. Run `scripts/controller-election-smoke.sh` to exercise a durable fixed-voter controller election, stop the elected controller process, verify a replacement election, and restart the old voter from persisted term/vote/log/commit state.
 
-Run `scripts/data-integrity.sh` after changing storage, replication, offset, record, or recovery code.
+The controller election smoke script uses client ports `29392`–`29394`, peer ports `29492`–`29494`, and admin ports `29592`–`29594`; these ports must be free. It requires `curl`, `nc`, and `python3`. The replication script has its own documented port range in `DISTRIBUTED-REPLICATION-GUIDE.md`.
 
-Run `scripts/crash-restart.sh` only when port `19092` is free and `nc` is installed. It builds the broker and CLI, produces one record with `acks=leader`, kills the broker with SIGKILL, restarts it with the same temporary data directory, consumes from offset zero, verifies the value, and then tests SIGTERM shutdown. This proves local single-broker log recovery for that experiment; it does not prove replica recovery.
+Run `scripts/crash-restart.sh` only when port `19092` is free and `nc` is installed. It builds the broker and CLI, produces one record with `acks=leader`, kills the broker with SIGKILL, restarts it with the same temporary data directory, consumes from offset zero, verifies the value, and then tests SIGTERM shutdown. This proves local log recovery, not replica failover.
 
 Run `scripts/benchmark.sh` before and after a performance change. Record Go version, OS, architecture, CPU, flags, and commit. Compare the same machine and flags.
 
@@ -32,16 +35,18 @@ Run `scripts/benchmark.sh` before and after a performance change. Record Go vers
 
 | Experiment | Required invariant | Current status |
 |---|---|---|
-| Single broker process crash | Sync-acknowledged local records recover from the same data directory | Automated script and runtime test included |
-| Pod replacement | StatefulSet recreates pod identity and reattaches its PVC | Manifest supports it; requires a provisioned PVC |
-| Follower isolation | ISR/high watermark do not advance using an unavailable follower | Replication manager tests exist; live TCP path pending |
-| Leader crash | Only an eligible in-sync replica can be promoted; stale leader epoch is fenced | In-memory manager tests; live cluster orchestration pending |
-| Controller majority loss | No minority controller commits metadata | Controller simulation tests; persistent/networked consensus pending |
-| Replica lag | Follower catches up before rejoining ISR | Manager/recovery tests; live process integration pending |
+| Single broker process crash | Sync-acknowledged local records recover from same data directory | Automated script and runtime test included |
+| Broker process membership | Seed join discovers all configured brokers | Three-process membership smoke test passes; no failure detector/removal |
+| Follower process unavailable | Writes proceed only if MinISR still holds | Three-process replication smoke test covers one follower down and both followers down |
+| Uncommitted log tail | Consumers do not read offsets at/above high watermark | Replication smoke test covers leader and follower filtering |
+| Controller leader process failure | A majority elects one replacement; restarted old voter rejoins as follower | Three-process durable controller-election smoke test included |
+| Controller quorum loss | No minority controller wins an election or commits metadata | Majority vote enforced in fixed-voter election; live metadata proposal/quorum-commit path and explicit partition test pending |
+| Partition leader process failure | Only a replica with complete committed prefix may be promoted | Automatic partition leader failover is not yet implemented |
+| Replica returns | Old replica catches up before rejoining ISR | Package-level recovery tests exist; runtime auto-catch-up/rejoin is pending |
 | Disk full/write failure | Failed append is not acknowledged as durable | Unit/failure tests; filesystem chaos job pending |
 | Record corruption | Checksummed runtime message envelope detects payload corruption | CRC32 envelope tests; no universal segment checksum for arbitrary raw storage records |
 | Consumer crash | Redelivery follows selected delivery semantics | Package tests; external side-effect integration pending |
-| Network partition | No split-brain leader or conflicting committed metadata | Simulated-link tests; live cluster test pending |
+| Network partition | No split-brain controller leader | Fixed-voter majority election tested via process kill; live network-partition chaos and full Raft metadata proposal tests pending |
 
 ## CI guidance
 
@@ -52,18 +57,19 @@ A CI pipeline should run:
 3. `go build ./cmd/broker ./cmd/client`
 4. `go vet ./...`
 5. YAML validation and Docker image build.
-6. The single-broker crash/restart script on a runner with `nc`.
+6. Membership, replication, controller-election, and single-broker crash/restart smoke tests on an isolated runner.
 
 Do not make benchmark nanoseconds a hard pass/fail gate until there is a stable runner and statistically defensible baseline. For distributed chaos jobs, preserve logs, broker IDs, terms, leader epochs, high watermarks, test seeds, and volume identities as artifacts.
 
 ## Exit criteria for a distributed production release
 
-- Persist controller term/vote/log/commit state and metadata.
-- Run a real multi-process controller quorum over authenticated/TLS peer transport.
-- Connect replication batches to remote brokers and enforce ISR/high-watermark semantics across processes.
-- Route clients to leaders using current cluster metadata.
+- Commit broker registration and partition assignments through the live controller Raft log and apply committed metadata on every broker.
+- Make committed controller metadata authoritative for replica sets and partition leader epochs.
+- Implement safe partition leader promotion, dynamic ISR membership, replica reassignment, catch-up, and old-leader fencing.
+- Route clients to partition leaders using refreshed committed metadata.
+- Add authenticated/TLS-protected peer communication and safe voter reconfiguration.
 - Expose topic administration, group membership, and offset APIs over the versioned protocol.
 - Integrate API-key auth/ACLs and secure client TLS.
 - Validate data format migration and corruption handling.
-- Pass end-to-end three-broker produce, failover, catch-up, and consume tests.
+- Pass end-to-end three-broker produce, partition failover, catch-up, and consume tests.
 - Define SLOs for availability, p95/p99 latency, throughput, recovery time, and RPO.

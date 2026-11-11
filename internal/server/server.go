@@ -17,12 +17,14 @@ import (
 
 	"github.com/ARIN00-web/messlessmq/internal/broker"
 	"github.com/ARIN00-web/messlessmq/internal/config"
+	"github.com/ARIN00-web/messlessmq/internal/controller"
 	"github.com/ARIN00-web/messlessmq/internal/interbroker"
 	"github.com/ARIN00-web/messlessmq/internal/membership"
 	"github.com/ARIN00-web/messlessmq/internal/network"
 	"github.com/ARIN00-web/messlessmq/internal/observability"
 	"github.com/ARIN00-web/messlessmq/internal/operations"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/replication"
 	"github.com/ARIN00-web/messlessmq/internal/security"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
@@ -37,26 +39,29 @@ type Options struct {
 }
 
 type Server struct {
-	cfg         config.Config
-	adminAddr   string
-	logger      *slog.Logger
-	registry    *topic.Registry
-	topics      []*topic.Topic
-	dispatch    *broker.Dispatcher
-	controls    *operations.Controls
-	limiter     *security.RateLimiter
-	metrics     *observability.Registry
-	requests    *observability.Counter
-	failures    *observability.Counter
-	produced    *observability.Counter
-	consumed    *observability.Counter
-	latency     *observability.Histogram
-	members     *membership.Registry
-	seeds       []membership.Seed
-	assignments map[partitionKey]partitionReplicaAssignment
-	replicator  *distributedAppender
-	health      *observability.HealthChecker
-	diagnostics *observability.Diagnostics
+	cfg               config.Config
+	adminAddr         string
+	logger            *slog.Logger
+	registry          *topic.Registry
+	topics            []*topic.Topic
+	dispatch          *broker.Dispatcher
+	controls          *operations.Controls
+	limiter           *security.RateLimiter
+	metrics           *observability.Registry
+	requests          *observability.Counter
+	failures          *observability.Counter
+	produced          *observability.Counter
+	consumed          *observability.Counter
+	latency           *observability.Histogram
+	members           *membership.Registry
+	seeds             []membership.Seed
+	assignments       map[partitionKey]partitionReplicaAssignment
+	replicator        *distributedAppender
+	commits           *replication.CommitStore
+	controllerNode    *controller.DurableNode
+	controllerRuntime *controllerRuntime
+	health            *observability.HealthChecker
+	diagnostics       *observability.Diagnostics
 
 	serveOnce sync.Once
 }
@@ -101,6 +106,36 @@ func New(options Options) (*Server, error) {
 			return nil, fmt.Errorf("open topic %q storage: %w", definition.Name, err)
 		}
 		opened = append(opened, registeredTopic)
+	}
+
+	commits, err := replication.OpenCommitStore(filepath.Join(cfg.DataDir, "metadata", "commits"))
+	if err != nil {
+		_ = closeTopics(opened)
+		return nil, fmt.Errorf("open replication commit store: %w", err)
+	}
+	for _, registeredTopic := range opened {
+		for _, partition := range registeredTopic.Partitions() {
+			startOffset, logEnd, rangeErr := partition.OffsetRange()
+			if rangeErr != nil {
+				_ = closeTopics(opened)
+				return nil, fmt.Errorf("read initial range for %s:%d: %w", registeredTopic.Name(), partition.ID(), rangeErr)
+			}
+			leaderID, leaderEpoch, initialHighWatermark := cfg.BrokerID, uint64(1), logEnd
+			if assignment, assigned := assignments[partitionKey{Topic: registeredTopic.Name(), PartitionID: partition.ID()}]; assigned {
+				leaderID, leaderEpoch, initialHighWatermark = assignment.LeaderID, assignment.LeaderEpoch, startOffset
+			}
+			state, initErr := commits.Initialize(registeredTopic.Name(), partition.ID(), initialHighWatermark, logEnd, leaderID, leaderEpoch)
+			if initErr != nil {
+				_ = closeTopics(opened)
+				return nil, fmt.Errorf("initialize commit state for %s:%d: %w", registeredTopic.Name(), partition.ID(), initErr)
+			}
+			if state.HighWatermark < startOffset {
+				if _, advanceErr := commits.Advance(registeredTopic.Name(), partition.ID(), startOffset, leaderID, leaderEpoch, logEnd); advanceErr != nil {
+					_ = closeTopics(opened)
+					return nil, fmt.Errorf("advance commit state after retention for %s:%d: %w", registeredTopic.Name(), partition.ID(), advanceErr)
+				}
+			}
+		}
 	}
 
 	metrics := observability.NewRegistry()
@@ -152,12 +187,41 @@ func New(options Options) (*Server, error) {
 		}
 	}
 
-	dispatcher := broker.NewDispatcher(registry)
-	var distributed *distributedAppender
-	if len(assignments) > 0 {
-		distributed = newDistributedAppender(cfg.BrokerID, members, assignments, cfg.MinISR)
-		dispatcher.SetPartitionAppendFunc(distributed.Append)
+	var durableController *controller.DurableNode
+	var controllerRuntimeInstance *controllerRuntime
+	if len(cfg.ControllerVoters) > 0 {
+		if members == nil {
+			_ = closeTopics(opened)
+			return nil, errors.New("controller voters require cluster membership")
+		}
+		peers := make([]string, 0, len(cfg.ControllerVoters)-1)
+		for _, voter := range cfg.ControllerVoters {
+			if voter != cfg.BrokerID {
+				peers = append(peers, voter)
+			}
+		}
+		durableController, err = controller.OpenDurableNode(cfg.BrokerID, peers, filepath.Join(cfg.DataDir, "metadata", "controller"))
+		if err != nil {
+			_ = closeTopics(opened)
+			return nil, fmt.Errorf("open durable controller state: %w", err)
+		}
+		controllerRuntimeInstance, err = newControllerRuntime(cfg.BrokerID, cfg.ControllerVoters, durableController, members, cfg, options.Logger)
+		if err != nil {
+			_ = closeTopics(opened)
+			return nil, fmt.Errorf("initialize controller runtime: %w", err)
+		}
 	}
+
+	dispatcher := broker.NewDispatcher(registry)
+	distributed := newDistributedAppender(cfg.BrokerID, members, assignments, cfg.MinISR, commits)
+	dispatcher.SetPartitionAppendFunc(distributed.Append)
+	dispatcher.SetHighWatermarkLookup(func(topicName string, partitionID uint32) (uint64, error) {
+		state, exists := commits.Get(topicName, partitionID)
+		if !exists {
+			return 0, fmt.Errorf("commit state missing for %s:%d: %w", topicName, partitionID, replication.ErrInvalidCommitState)
+		}
+		return state.HighWatermark, nil
+	})
 	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members, assignments: assignments})
 	health := observability.NewHealthChecker()
 	if err := health.Register("partition_logs", 2*time.Second, func(ctx context.Context) error {
@@ -182,7 +246,8 @@ func New(options Options) (*Server, error) {
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
 		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
-		assignments: assignments, replicator: distributed, health: health,
+		assignments: assignments, replicator: distributed, commits: commits,
+		controllerNode: durableController, controllerRuntime: controllerRuntimeInstance, health: health,
 		diagnostics: observability.NewDiagnostics(),
 	}, nil
 }
@@ -252,8 +317,23 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 		_ = listener.Close()
 		return nil, err
 	}
+	if s.controllerRuntime != nil {
+		controllerHandler, handlerErr := interbroker.NewDurableControllerHandler(s.controllerNode, s.controllerRuntime.NotifyLeaderContact)
+		if handlerErr != nil {
+			_ = listener.Close()
+			return nil, handlerErr
+		}
+		if err := mux.Register(interbroker.MessageVoteRequest, controllerHandler); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+		if err := mux.Register(interbroker.MessageAppendEntries, controllerHandler); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+	}
 	if len(s.assignments) > 0 {
-		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignments)
+		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignments, s.commits)
 		if handlerErr != nil {
 			_ = listener.Close()
 			return nil, handlerErr
@@ -266,17 +346,23 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 			_ = listener.Close()
 			return nil, err
 		}
+		if err := mux.Register(interbroker.MessageReplicationCommit, replicationHandler); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
 	}
 	peerServer, err := interbroker.NewServer(mux)
 	if err != nil {
 		_ = listener.Close()
 		return nil, err
 	}
+	runtimeCtx, cancelRuntime := context.WithCancel(ctx)
 	peerDone := make(chan error, 1)
 	go func() { peerDone <- peerServer.Serve(listener) }()
 	var stopOnce sync.Once
 	stop := func() {
 		stopOnce.Do(func() {
+			cancelRuntime()
 			_ = listener.Close()
 			<-peerDone
 		})
@@ -309,6 +395,10 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	}
 	snapshot := s.members.Snapshot()
 	s.logger.Info("broker cluster membership ready", "cluster_id", snapshot.ClusterID, "version", snapshot.Version, "members", len(snapshot.Brokers), "peer_address", listener.Addr().String())
+	if s.controllerRuntime != nil {
+		s.controllerRuntime.Start(runtimeCtx)
+		s.logger.Info("durable controller runtime started", "broker_id", s.cfg.BrokerID, "voters", s.cfg.ControllerVoters)
+	}
 	return stop, nil
 }
 
@@ -324,6 +414,22 @@ func (s *Server) handleClusterMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(s.members.Snapshot()); err != nil {
+		return
+	}
+}
+
+func (s *Server) handleControllerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.controllerRuntime == nil {
+		http.Error(w, "controller runtime is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(s.controllerRuntime.Status()); err != nil {
 		return
 	}
 }
@@ -353,6 +459,9 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		mux.Handle("/diagnostics", s.diagnostics.Handler())
 		if s.members != nil {
 			mux.HandleFunc("/cluster/members", s.handleClusterMembers)
+		}
+		if s.controllerRuntime != nil {
+			mux.HandleFunc("/controller/status", s.handleControllerStatus)
 		}
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {

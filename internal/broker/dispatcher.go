@@ -46,6 +46,17 @@ func (d *Dispatcher) SetPartitionAppendFunc(fn PartitionAppendFunc) {
 	}
 }
 
+// SetHighWatermarkLookup installs the committed-read boundary on the consume
+// handler. Call during broker construction before serving requests.
+func (d *Dispatcher) SetHighWatermarkLookup(lookup HighWatermarkLookup) {
+	if d == nil {
+		return
+	}
+	if handler, ok := d.consumeHandler.(*ConsumeHandler); ok {
+		handler.SetHighWatermarkLookup(lookup)
+	}
+}
+
 func (d *Dispatcher) SetMetadataHandler(handler Handler) {
 	if d == nil {
 		return

@@ -111,6 +111,10 @@ func TestRuntimeProducesConsumesAndPersistsAcrossRestart(t *testing.T) {
 	if len(appendResult.Records) != 1 || appendResult.Records[0].Offset != 0 {
 		t.Fatalf("unexpected produce response: %+v", appendResult)
 	}
+	commitState, exists := first.commits.Get("orders", appendResult.Records[0].PartitionID)
+	if !exists || commitState.HighWatermark != 1 {
+		t.Fatalf("standalone commit state = %+v exists=%t, want high watermark 1", commitState, exists)
+	}
 
 	metadataPayload, err := protocol.EncodeMetadataRequest(protocol.MetadataRequest{Topic: "orders"})
 	if err != nil {
@@ -150,6 +154,10 @@ func TestRuntimeProducesConsumesAndPersistsAcrossRestart(t *testing.T) {
 	restarted, err := New(Options{Config: testConfig(dataDir), Logger: logger})
 	if err != nil {
 		t.Fatal(err)
+	}
+	recoveredCommit, exists := restarted.commits.Get("orders", appendResult.Records[0].PartitionID)
+	if !exists || recoveredCommit.HighWatermark != 1 {
+		t.Fatalf("recovered commit state = %+v exists=%t, want high watermark 1", recoveredCommit, exists)
 	}
 	conn2, cancel2, done2 := startTestServer(t, restarted)
 	consumePayload, err = protocol.EncodeConsumeRequest(protocol.ConsumeRequest{Topic: "orders", PartitionID: appendResult.Records[0].PartitionID, Offset: 0, MaxMessages: 10})
