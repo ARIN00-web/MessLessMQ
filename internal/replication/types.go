@@ -79,8 +79,8 @@ type Record struct {
 }
 
 // ReplicationBatch is the logical binary-protocol payload exchanged by a
-// leader and follower. Network transport is intentionally added later, when
-// inter-broker communication is introduced.
+// leader and follower. The broker runtime carries this payload over the
+// inter-broker transport; the replication package remains transport-neutral.
 type ReplicationBatch struct {
 	Version     uint16
 	Topic       string

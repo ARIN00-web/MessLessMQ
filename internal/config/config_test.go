@@ -99,3 +99,30 @@ func TestClusterMembershipConfigurationMustBeComplete(t *testing.T) {
 		t.Fatal("empty advertised peer host should be rejected")
 	}
 }
+
+func TestLoadReplicationConfiguration(t *testing.T) {
+	values := map[string]string{
+		"MESSLESSMQ_BROKER_ID":              "broker-2",
+		"MESSLESSMQ_CLUSTER_ID":             "orders-cluster",
+		"MESSLESSMQ_PEER_LISTEN_ADDRESS":    ":19093",
+		"MESSLESSMQ_PEER_ADVERTISE_ADDRESS": "broker-2:19093",
+		"MESSLESSMQ_SEEDS":                  "broker-1@broker-1:19093",
+		"MESSLESSMQ_REPLICA_ASSIGNMENTS":    "orders:0=broker-1,broker-2,broker-3",
+		"MESSLESSMQ_MIN_ISR":                "2",
+	}
+	cfg, err := Load(func(key string) (string, bool) { value, ok := values[key]; return value, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReplicaAssignments != values["MESSLESSMQ_REPLICA_ASSIGNMENTS"] || cfg.MinISR != 2 {
+		t.Fatalf("unexpected replication config: %+v", cfg)
+	}
+}
+
+func TestReplicaAssignmentsRequireMembership(t *testing.T) {
+	cfg := Defaults()
+	cfg.ReplicaAssignments = "orders:0=broker-1,broker-2"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("replica assignments without cluster membership should be rejected")
+	}
+}

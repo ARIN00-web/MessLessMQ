@@ -53,6 +53,8 @@ type Server struct {
 	latency     *observability.Histogram
 	members     *membership.Registry
 	seeds       []membership.Seed
+	assignments map[partitionKey]partitionReplicaAssignment
+	replicator  *distributedAppender
 	health      *observability.HealthChecker
 	diagnostics *observability.Diagnostics
 
@@ -78,6 +80,13 @@ func New(options Options) (*Server, error) {
 	definitions, err := loadTopicCatalog(cfg.DataDir, options.BootstrapTopics)
 	if err != nil {
 		return nil, err
+	}
+	assignments, err := parseReplicaAssignments(cfg.ReplicaAssignments)
+	if err != nil {
+		return nil, fmt.Errorf("parse replica assignments: %w", err)
+	}
+	if err := validateReplicaAssignments(definitions, assignments, cfg.MinISR); err != nil {
+		return nil, fmt.Errorf("validate replica assignments: %w", err)
 	}
 	registry := topic.NewRegistry()
 	opened := make([]*topic.Topic, 0, len(definitions))
@@ -144,7 +153,12 @@ func New(options Options) (*Server, error) {
 	}
 
 	dispatcher := broker.NewDispatcher(registry)
-	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members})
+	var distributed *distributedAppender
+	if len(assignments) > 0 {
+		distributed = newDistributedAppender(cfg.BrokerID, members, assignments, cfg.MinISR)
+		dispatcher.SetPartitionAppendFunc(distributed.Append)
+	}
+	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members, assignments: assignments})
 	health := observability.NewHealthChecker()
 	if err := health.Register("partition_logs", 2*time.Second, func(ctx context.Context) error {
 		for _, registeredTopic := range opened {
@@ -167,7 +181,8 @@ func New(options Options) (*Server, error) {
 		cfg: cfg, adminAddr: strings.TrimSpace(options.AdminAddress), logger: options.Logger,
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
-		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds, health: health,
+		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
+		assignments: assignments, replicator: distributed, health: health,
 		diagnostics: observability.NewDiagnostics(),
 	}, nil
 }
@@ -236,6 +251,21 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	if err := mux.Register(interbroker.MessageBrokerJoin, handler); err != nil {
 		_ = listener.Close()
 		return nil, err
+	}
+	if len(s.assignments) > 0 {
+		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignments)
+		if handlerErr != nil {
+			_ = listener.Close()
+			return nil, handlerErr
+		}
+		if err := mux.Register(interbroker.MessageReplicationBatch, replicationHandler); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+		if err := mux.Register(interbroker.MessageReplicationStatus, replicationHandler); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
 	}
 	peerServer, err := interbroker.NewServer(mux)
 	if err != nil {

@@ -9,10 +9,11 @@ import (
 )
 
 type localMetadataHandler struct {
-	brokerID string
-	address  string
-	registry *topic.Registry
-	members  *membership.Registry
+	brokerID    string
+	address     string
+	registry    *topic.Registry
+	members     *membership.Registry
+	assignments map[partitionKey]partitionReplicaAssignment
 }
 
 func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) {
@@ -33,10 +34,13 @@ func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) 
 		Version: 1,
 		Brokers: []protocol.BrokerMetadata{{ID: h.brokerID, Address: h.address}},
 	}
+	knownBrokers := map[string]struct{}{h.brokerID: {}}
 	if h.members != nil {
 		snapshot := h.members.Snapshot()
+		response.Version = snapshot.Version
 		response.Brokers = response.Brokers[:0]
 		for _, member := range snapshot.Brokers {
+			knownBrokers[member.ID] = struct{}{}
 			response.Brokers = append(response.Brokers, protocol.BrokerMetadata{
 				ID: member.ID, Address: member.ClientAddress,
 			})
@@ -51,9 +55,26 @@ func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) 
 			return nil, err
 		}
 		for _, partition := range registeredTopic.Partitions() {
+			key := partitionKey{Topic: topicName, PartitionID: partition.ID()}
+			assignment, assigned := h.assignments[key]
+			if !assigned {
+				assignment = partitionReplicaAssignment{Topic: topicName, PartitionID: partition.ID(), Replicas: []string{h.brokerID}, LeaderID: h.brokerID, LeaderEpoch: 1}
+			}
+			// Metadata must not advertise a leader/replica whose broker address is
+			// not yet known locally. A later metadata request sees the converged view.
+			allKnown := true
+			for _, replicaID := range assignment.Replicas {
+				if _, ok := knownBrokers[replicaID]; !ok {
+					allKnown = false
+					break
+				}
+			}
+			if !allKnown {
+				continue
+			}
 			response.Partitions = append(response.Partitions, protocol.PartitionMetadata{
 				Topic: topicName, PartitionID: partition.ID(),
-				Replicas: []string{h.brokerID}, Leader: h.brokerID, LeaderEpoch: 1,
+				Replicas: append([]string(nil), assignment.Replicas...), Leader: assignment.LeaderID, LeaderEpoch: assignment.LeaderEpoch,
 			})
 		}
 	}

@@ -13,8 +13,8 @@ const (
 )
 
 // EncodeReplicationBatch encodes a versioned replication batch using network
-// byte order. The batch is transport-neutral; Phase 16.5 will carry it over
-// the inter-broker connection.
+// byte order. The batch is transport-neutral and is carried by the broker
+// runtime over the inter-broker connection.
 //
 // Layout:
 //

@@ -23,6 +23,7 @@ const (
 	MessageReplicationBatch
 	MessageHeartbeat
 	MessageBrokerJoin
+	MessageReplicationStatus
 )
 
 var (

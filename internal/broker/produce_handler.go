@@ -12,8 +12,11 @@ import (
 
 const ProduceAPIVersion uint16 = 1
 
+type PartitionAppendFunc func(partition *topic.Partition, topicName string, value []byte, timestamp int64, ack protocol.AckMode) (uint64, error)
+
 type ProduceHandler struct {
 	registry *topic.Registry
+	appendFn PartitionAppendFunc
 
 	mu          sync.Mutex
 	assignments map[string]*PartitionAssignment
@@ -25,6 +28,16 @@ func NewProduceHandler(registries ...*topic.Registry) *ProduceHandler {
 		registry = registries[0]
 	}
 	return &ProduceHandler{registry: registry, assignments: make(map[string]*PartitionAssignment)}
+}
+
+// SetPartitionAppendFunc installs the broker runtime's append policy. It must
+// be called during startup, before the handler is used by request goroutines.
+// A nil function restores the local-only append behaviour.
+func (h *ProduceHandler) SetPartitionAppendFunc(fn PartitionAppendFunc) {
+	if h == nil {
+		return
+	}
+	h.appendFn = fn
 }
 
 type plannedMessage struct {
@@ -90,15 +103,18 @@ func (h *ProduceHandler) Handle(req protocol.Request) ([]byte, error) {
 			return nil, fmt.Errorf("encode message %d: %w", i, encodeErr)
 		}
 		var offset uint64
-		switch produceRequest.AckMode {
-		case protocol.AckNone:
-			offset, err = item.partition.AppendAt(storedValue, item.message.Timestamp)
-		case protocol.AckLeader, protocol.AckAll:
-			// In this standalone runtime the local broker is the entire ISR.
-			// AckAll is therefore equivalent to a durable local acknowledgement.
-			offset, err = item.partition.AppendAtSync(storedValue, item.message.Timestamp)
-		default:
-			err = protocol.ErrInvalidAckMode
+		if h.appendFn != nil {
+			offset, err = h.appendFn(item.partition, item.message.Topic, storedValue, item.message.Timestamp, produceRequest.AckMode)
+		} else {
+			switch produceRequest.AckMode {
+			case protocol.AckNone:
+				offset, err = item.partition.AppendAt(storedValue, item.message.Timestamp)
+			case protocol.AckLeader, protocol.AckAll:
+				// Without a distributed appender, this broker is the entire ISR.
+				offset, err = item.partition.AppendAtSync(storedValue, item.message.Timestamp)
+			default:
+				err = protocol.ErrInvalidAckMode
+			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("append message %d after %d successful appends: %w", i, len(response.Records), err)

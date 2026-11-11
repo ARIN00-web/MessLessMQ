@@ -14,6 +14,8 @@ const (
 	ErrorInvalidFetchLimit  uint16 = 10
 	ErrorUnsupportedVersion uint16 = 11
 	ErrorRateLimited        uint16 = 12
+	ErrorNotPartitionLeader uint16 = 13
+	ErrorInsufficientISR    uint16 = 14
 )
 
 type Response struct {

@@ -35,6 +35,17 @@ func NewDispatcher(registries ...*topic.Registry) *Dispatcher {
 	}
 }
 
+// SetPartitionAppendFunc installs the runtime append policy on the produce
+// handler. Call during broker construction before serving requests.
+func (d *Dispatcher) SetPartitionAppendFunc(fn PartitionAppendFunc) {
+	if d == nil {
+		return
+	}
+	if handler, ok := d.produceHandler.(*ProduceHandler); ok {
+		handler.SetPartitionAppendFunc(fn)
+	}
+}
+
 func (d *Dispatcher) SetMetadataHandler(handler Handler) {
 	if d == nil {
 		return

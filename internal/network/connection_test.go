@@ -24,6 +24,8 @@ func TestErrorCodeFromError(t *testing.T) {
 		{name: "offset out of range", err: consumer.ErrOffsetOutOfRange, want: protocol.ErrorOffsetOutOfRange},
 		{name: "invalid fetch limit", err: consumer.ErrInvalidFetchLimit, want: protocol.ErrorInvalidFetchLimit},
 		{name: "unsupported version", err: protocol.ErrUnsupportedVersion, want: protocol.ErrorUnsupportedVersion},
+		{name: "not partition leader", err: protocol.ErrNotPartitionLeader, want: protocol.ErrorNotPartitionLeader},
+		{name: "insufficient ISR", err: protocol.ErrInsufficientISR, want: protocol.ErrorInsufficientISR},
 		{name: "internal error", err: errors.New("something went wrong"), want: protocol.ErrorInternal},
 	}
 	for _, tt := range tests {

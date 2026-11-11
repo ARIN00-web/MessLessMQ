@@ -99,6 +99,12 @@ func errorCodeFromError(err error) uint16 {
 	if errors.Is(err, protocol.ErrRateLimited) {
 		return protocol.ErrorRateLimited
 	}
+	if errors.Is(err, protocol.ErrNotPartitionLeader) {
+		return protocol.ErrorNotPartitionLeader
+	}
+	if errors.Is(err, protocol.ErrInsufficientISR) {
+		return protocol.ErrorInsufficientISR
+	}
 	if errors.Is(err, topic.ErrTopicNotFound) {
 		return protocol.ErrorUnknownTopic
 	}

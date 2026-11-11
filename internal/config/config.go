@@ -32,6 +32,8 @@ type Config struct {
 	PeerAdvertiseAddress string
 	SeedPeers            []string
 	PeerJoinTimeout      time.Duration
+	ReplicaAssignments   string
+	MinISR               int
 }
 
 func Defaults() Config {
@@ -40,7 +42,7 @@ func Defaults() Config {
 		AdvertiseAddress: "127.0.0.1:9092", DataDir: "./data", LogLevel: "info",
 		MaxConnections: 10000, RequestTimeout: 10 * time.Second,
 		ShutdownTimeout: 30 * time.Second, RateLimitPerSecond: 1000,
-		RateLimitBurst: 2000, PeerJoinTimeout: 30 * time.Second,
+		RateLimitBurst: 2000, PeerJoinTimeout: 30 * time.Second, MinISR: 1,
 	}
 }
 
@@ -76,6 +78,7 @@ func Load(getenv LookupEnv) (Config, error) {
 	readString("CLUSTER_ID", &cfg.ClusterID)
 	readString("PEER_LISTEN_ADDRESS", &cfg.PeerListenAddress)
 	readString("PEER_ADVERTISE_ADDRESS", &cfg.PeerAdvertiseAddress)
+	readString("REPLICA_ASSIGNMENTS", &cfg.ReplicaAssignments)
 	if value, ok := getenv("MESSLESSMQ_SEEDS"); ok {
 		for _, seed := range strings.Split(value, ",") {
 			if seed = strings.TrimSpace(seed); seed != "" {
@@ -90,6 +93,9 @@ func Load(getenv LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RateLimitBurst, err = intValue(getenv, "RATE_LIMIT_BURST", cfg.RateLimitBurst); err != nil {
+		return Config{}, err
+	}
+	if cfg.MinISR, err = intValue(getenv, "MIN_ISR", cfg.MinISR); err != nil {
 		return Config{}, err
 	}
 	if cfg.RequestTimeout, err = durationValue(getenv, "REQUEST_TIMEOUT", cfg.RequestTimeout); err != nil {
@@ -195,7 +201,13 @@ func (c Config) Validate() error {
 	if c.RateLimitBurst <= 0 {
 		problems = append(problems, "rate limit burst must be positive")
 	}
+	if c.MinISR < 1 {
+		problems = append(problems, "minimum in-sync replicas must be at least one")
+	}
 	peerConfigured := c.ClusterID != "" || c.PeerListenAddress != "" || c.PeerAdvertiseAddress != "" || len(c.SeedPeers) > 0
+	if strings.TrimSpace(c.ReplicaAssignments) != "" && !peerConfigured {
+		problems = append(problems, "replica assignments require cluster membership configuration")
+	}
 	if peerConfigured {
 		if strings.TrimSpace(c.ClusterID) == "" || len(c.ClusterID) > 128 {
 			problems = append(problems, "cluster ID is required and must be at most 128 characters")

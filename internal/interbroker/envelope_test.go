@@ -54,3 +54,18 @@ func TestBrokerJoinMessageTypeIsStableAndRoundTrips(t *testing.T) {
 		t.Fatalf("decoded envelope = %+v", got)
 	}
 }
+
+func TestReplicationStatusMessageTypeRoundTrip(t *testing.T) {
+	envelope := Envelope{Type: MessageReplicationStatus, RequestID: 77, SourceID: "broker-1", TargetID: "broker-2", Payload: []byte("status")}
+	encoded, err := EncodeEnvelope(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeEnvelope(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Type != MessageReplicationStatus || decoded.RequestID != envelope.RequestID || string(decoded.Payload) != "status" {
+		t.Fatalf("unexpected decoded envelope: %+v", decoded)
+	}
+}

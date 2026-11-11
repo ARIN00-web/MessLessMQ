@@ -9,4 +9,6 @@ var (
 	ErrInvalidFetchLimit  = errors.New("invalid fetch limit")
 	ErrUnsupportedVersion = errors.New("unsupported API version")
 	ErrRateLimited        = errors.New("request rate limit exceeded")
+	ErrNotPartitionLeader = errors.New("request reached a broker that is not the partition leader")
+	ErrInsufficientISR    = errors.New("not enough in-sync replicas acknowledged the append")
 )
