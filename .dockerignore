@@ -1,0 +1,12 @@
+.git
+.gitignore
+.DS_Store
+*.out
+*.prof
+coverage*
+benchmarks*
+.tmp
+.tmp-*
+data/
+logs/
+node_modules/

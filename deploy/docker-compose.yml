@@ -1,0 +1,29 @@
+x-broker: &broker
+  image: messlessmq:phase20
+  restart: unless-stopped
+  networks:
+    - messlessmq-lab
+
+services:
+  broker-1:
+    <<: *broker
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "19092:9092"
+
+  broker-2:
+    <<: *broker
+    ports:
+      - "19093:9092"
+
+  broker-3:
+    <<: *broker
+    ports:
+      - "19094:9092"
+
+networks:
+  messlessmq-lab:
+    name: messlessmq-lab
+    driver: bridge
