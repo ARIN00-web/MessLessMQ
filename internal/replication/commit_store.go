@@ -240,3 +240,39 @@ func (s *CommitStore) persist(state CommitState) error {
 	}
 	return nil
 }
+
+// UpdateLeader applies a controller-committed partition leader epoch to this
+// replica's durable commit state. It preserves the current high watermark and
+// refuses stale epochs or a different leader reusing the same epoch.
+func (s *CommitStore) UpdateLeader(topic string, partitionID uint32, leaderID string, leaderEpoch, logEnd uint64) (CommitState, error) {
+	if s == nil || strings.TrimSpace(topic) == "" || strings.TrimSpace(leaderID) == "" || leaderEpoch == 0 {
+		return CommitState{}, ErrInvalidCommitState
+	}
+	key := commitKey{topic: topic, partitionID: partitionID}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, exists := s.states[key]
+	if !exists {
+		return CommitState{}, fmt.Errorf("partition %s:%d has no initialized commit state: %w", topic, partitionID, ErrInvalidCommitState)
+	}
+	if current.HighWatermark > logEnd {
+		return CommitState{}, ErrCommitAheadOfLog
+	}
+	if leaderEpoch < current.LeaderEpoch {
+		return CommitState{}, ErrCommitLeader
+	}
+	if leaderEpoch == current.LeaderEpoch {
+		if leaderID != current.LeaderID {
+			return CommitState{}, ErrCommitLeader
+		}
+		return current, nil
+	}
+	updated := current
+	updated.LeaderID = leaderID
+	updated.LeaderEpoch = leaderEpoch
+	if err := s.persist(updated); err != nil {
+		return CommitState{}, err
+	}
+	s.states[key] = updated
+	return updated, nil
+}

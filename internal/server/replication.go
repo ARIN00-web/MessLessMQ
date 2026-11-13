@@ -127,20 +127,21 @@ func validateReplicaAssignments(definitions []TopicDefinition, assignments map[p
 }
 
 type distributedAppender struct {
-	brokerID    string
-	members     *membership.Registry
-	assignments map[partitionKey]partitionReplicaAssignment
-	minISR      int
-	commits     *replication.CommitStore
-	transport   *interbroker.Transport
-	requestID   atomic.Uint64
-	locksMu     sync.Mutex
-	locks       map[partitionKey]*sync.Mutex
+	brokerID          string
+	members           *membership.Registry
+	assignments       *assignmentRegistry
+	requireAssignment bool
+	minISR            int
+	commits           *replication.CommitStore
+	transport         *interbroker.Transport
+	requestID         atomic.Uint64
+	locksMu           sync.Mutex
+	locks             map[partitionKey]*sync.Mutex
 }
 
-func newDistributedAppender(brokerID string, members *membership.Registry, assignments map[partitionKey]partitionReplicaAssignment, minISR int, commits *replication.CommitStore) *distributedAppender {
+func newDistributedAppender(brokerID string, members *membership.Registry, assignments *assignmentRegistry, requireAssignment bool, minISR int, commits *replication.CommitStore) *distributedAppender {
 	return &distributedAppender{
-		brokerID: brokerID, members: members, assignments: assignments, minISR: minISR, commits: commits,
+		brokerID: brokerID, members: members, assignments: assignments, requireAssignment: requireAssignment, minISR: minISR, commits: commits,
 		transport: interbroker.NewTransport(5 * time.Second), locks: make(map[partitionKey]*sync.Mutex),
 	}
 }
@@ -161,7 +162,10 @@ func (a *distributedAppender) Append(partition *topic.Partition, topicName strin
 		return 0, errors.New("distributed appender is not initialized")
 	}
 	key := partitionKey{Topic: topicName, PartitionID: partition.ID()}
-	assignment, assigned := a.assignments[key]
+	assignment, assigned := a.assignments.get(key)
+	if !assigned && a.requireAssignment {
+		return 0, protocol.ErrClusterMetadataUnavailable
+	}
 	if assigned && assignment.LeaderID != a.brokerID {
 		return 0, fmt.Errorf("partition %s:%d leader is %s, this broker is %s: %w", topicName, partition.ID(), assignment.LeaderID, a.brokerID, protocol.ErrNotPartitionLeader)
 	}
@@ -441,13 +445,13 @@ type replicationPeerHandler struct {
 	brokerID    string
 	members     *membership.Registry
 	registry    *topic.Registry
-	assignments map[partitionKey]partitionReplicaAssignment
+	assignments *assignmentRegistry
 	commits     *replication.CommitStore
 }
 
-func newReplicationPeerHandler(brokerID string, members *membership.Registry, registry *topic.Registry, assignments map[partitionKey]partitionReplicaAssignment, commits *replication.CommitStore) (*replicationPeerHandler, error) {
-	if brokerID == "" || members == nil || registry == nil || len(assignments) == 0 || commits == nil {
-		return nil, errors.New("replication peer handler requires broker identity, membership, assignments and commit store")
+func newReplicationPeerHandler(brokerID string, members *membership.Registry, registry *topic.Registry, assignments *assignmentRegistry, commits *replication.CommitStore) (*replicationPeerHandler, error) {
+	if brokerID == "" || members == nil || registry == nil || assignments == nil || commits == nil {
+		return nil, errors.New("replication peer handler requires broker identity, membership, assignment registry and commit store")
 	}
 	return &replicationPeerHandler{brokerID: brokerID, members: members, registry: registry, assignments: assignments, commits: commits}, nil
 }
@@ -488,7 +492,7 @@ func (h *replicationPeerHandler) Handle(ctx context.Context, request interbroker
 			return interbroker.Envelope{}, replication.ErrInvalidReplicationBatch
 		}
 		key := partitionKey{Topic: statusRequest.Topic, PartitionID: statusRequest.PartitionID}
-		assignment, ok := h.assignments[key]
+		assignment, ok := h.assignments.get(key)
 		if !ok {
 			return interbroker.Envelope{}, fmt.Errorf("no replica assignment for %s:%d", key.Topic, key.PartitionID)
 		}
@@ -522,7 +526,7 @@ func (h *replicationPeerHandler) Handle(ctx context.Context, request interbroker
 			return interbroker.Envelope{}, err
 		}
 		key := partitionKey{Topic: batch.Topic, PartitionID: batch.PartitionID}
-		assignment, ok := h.assignments[key]
+		assignment, ok := h.assignments.get(key)
 		if !ok {
 			return interbroker.Envelope{}, fmt.Errorf("no replica assignment for %s:%d", key.Topic, key.PartitionID)
 		}
@@ -558,7 +562,7 @@ func (h *replicationPeerHandler) Handle(ctx context.Context, request interbroker
 			return interbroker.Envelope{}, replication.ErrInvalidCommitState
 		}
 		key := partitionKey{Topic: commitRequest.Topic, PartitionID: commitRequest.PartitionID}
-		assignment, ok := h.assignments[key]
+		assignment, ok := h.assignments.get(key)
 		if !ok {
 			return interbroker.Envelope{}, fmt.Errorf("no replica assignment for %s:%d", key.Topic, key.PartitionID)
 		}

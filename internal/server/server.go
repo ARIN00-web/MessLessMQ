@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,29 +40,30 @@ type Options struct {
 }
 
 type Server struct {
-	cfg               config.Config
-	adminAddr         string
-	logger            *slog.Logger
-	registry          *topic.Registry
-	topics            []*topic.Topic
-	dispatch          *broker.Dispatcher
-	controls          *operations.Controls
-	limiter           *security.RateLimiter
-	metrics           *observability.Registry
-	requests          *observability.Counter
-	failures          *observability.Counter
-	produced          *observability.Counter
-	consumed          *observability.Counter
-	latency           *observability.Histogram
-	members           *membership.Registry
-	seeds             []membership.Seed
-	assignments       map[partitionKey]partitionReplicaAssignment
-	replicator        *distributedAppender
-	commits           *replication.CommitStore
-	controllerNode    *controller.DurableNode
-	controllerRuntime *controllerRuntime
-	health            *observability.HealthChecker
-	diagnostics       *observability.Diagnostics
+	cfg                config.Config
+	adminAddr          string
+	logger             *slog.Logger
+	registry           *topic.Registry
+	topics             []*topic.Topic
+	dispatch           *broker.Dispatcher
+	controls           *operations.Controls
+	limiter            *security.RateLimiter
+	metrics            *observability.Registry
+	requests           *observability.Counter
+	failures           *observability.Counter
+	produced           *observability.Counter
+	consumed           *observability.Counter
+	latency            *observability.Histogram
+	members            *membership.Registry
+	seeds              []membership.Seed
+	assignmentStore    *assignmentRegistry
+	desiredAssignments map[partitionKey]partitionReplicaAssignment
+	replicator         *distributedAppender
+	commits            *replication.CommitStore
+	controllerNode     *controller.DurableNode
+	controllerRuntime  *controllerRuntime
+	health             *observability.HealthChecker
+	diagnostics        *observability.Diagnostics
 
 	serveOnce sync.Once
 }
@@ -86,9 +88,13 @@ func New(options Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	assignments, err := parseReplicaAssignments(cfg.ReplicaAssignments)
+	configuredAssignments, err := parseReplicaAssignments(cfg.ReplicaAssignments)
 	if err != nil {
 		return nil, fmt.Errorf("parse replica assignments: %w", err)
+	}
+	assignments, err := buildControllerAssignments(definitions, configuredAssignments, cfg.ControllerVoters, cfg.MinISR)
+	if err != nil {
+		return nil, fmt.Errorf("build controller partition assignments: %w", err)
 	}
 	if err := validateReplicaAssignments(definitions, assignments, cfg.MinISR); err != nil {
 		return nil, fmt.Errorf("validate replica assignments: %w", err)
@@ -213,7 +219,14 @@ func New(options Options) (*Server, error) {
 	}
 
 	dispatcher := broker.NewDispatcher(registry)
-	distributed := newDistributedAppender(cfg.BrokerID, members, assignments, cfg.MinISR, commits)
+	assignmentStore := newAssignmentRegistry(assignments)
+	controllerEnabled := len(cfg.ControllerVoters) > 0
+	if controllerEnabled {
+		// In controller mode no partition assignment is authoritative until its
+		// command has been committed and applied by this broker's Raft node.
+		assignmentStore.replace(nil)
+	}
+	distributed := newDistributedAppender(cfg.BrokerID, members, assignmentStore, controllerEnabled, cfg.MinISR, commits)
 	dispatcher.SetPartitionAppendFunc(distributed.Append)
 	dispatcher.SetHighWatermarkLookup(func(topicName string, partitionID uint32) (uint64, error) {
 		state, exists := commits.Get(topicName, partitionID)
@@ -222,7 +235,7 @@ func New(options Options) (*Server, error) {
 		}
 		return state.HighWatermark, nil
 	})
-	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members, assignments: assignments})
+	dispatcher.SetMetadataHandler(&localMetadataHandler{brokerID: cfg.BrokerID, address: cfg.AdvertiseAddress, registry: registry, members: members, assignments: assignmentStore, controller: durableController})
 	health := observability.NewHealthChecker()
 	if err := health.Register("partition_logs", 2*time.Second, func(ctx context.Context) error {
 		for _, registeredTopic := range opened {
@@ -241,15 +254,19 @@ func New(options Options) (*Server, error) {
 		return nil, err
 	}
 
-	return &Server{
+	server := &Server{
 		cfg: cfg, adminAddr: strings.TrimSpace(options.AdminAddress), logger: options.Logger,
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
 		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
-		assignments: assignments, replicator: distributed, commits: commits,
+		assignmentStore: assignmentStore, desiredAssignments: assignments, replicator: distributed, commits: commits,
 		controllerNode: durableController, controllerRuntime: controllerRuntimeInstance, health: health,
 		diagnostics: observability.NewDiagnostics(),
-	}, nil
+	}
+	if server.controllerRuntime != nil {
+		server.controllerRuntime.onCommit = server.applyCommittedControllerMetadata
+	}
+	return server, nil
 }
 
 func closeTopics(topics []*topic.Topic) error {
@@ -318,7 +335,10 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 		return nil, err
 	}
 	if s.controllerRuntime != nil {
-		controllerHandler, handlerErr := interbroker.NewDurableControllerHandler(s.controllerNode, s.controllerRuntime.NotifyLeaderContact)
+		controllerHandler, handlerErr := interbroker.NewDurableControllerHandler(s.controllerNode, func() {
+			s.controllerRuntime.NotifyLeaderContact()
+			s.applyCommittedControllerMetadata()
+		})
 		if handlerErr != nil {
 			_ = listener.Close()
 			return nil, handlerErr
@@ -332,8 +352,8 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 			return nil, err
 		}
 	}
-	if len(s.assignments) > 0 {
-		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignments, s.commits)
+	if len(s.desiredAssignments) > 0 {
+		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignmentStore, s.commits)
 		if handlerErr != nil {
 			_ = listener.Close()
 			return nil, handlerErr
@@ -397,6 +417,7 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	s.logger.Info("broker cluster membership ready", "cluster_id", snapshot.ClusterID, "version", snapshot.Version, "members", len(snapshot.Brokers), "peer_address", listener.Addr().String())
 	if s.controllerRuntime != nil {
 		s.controllerRuntime.Start(runtimeCtx)
+		go s.runControllerMetadata(runtimeCtx)
 		s.logger.Info("durable controller runtime started", "broker_id", s.cfg.BrokerID, "voters", s.cfg.ControllerVoters)
 	}
 	return stop, nil
@@ -434,6 +455,42 @@ func (s *Server) handleControllerStatus(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+func (s *Server) handleControllerMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.controllerNode == nil {
+		http.Error(w, "controller metadata is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot := s.controllerNode.Metadata()
+	view := struct {
+		Version    uint64                           `json:"version"`
+		Brokers    []controller.Broker              `json:"brokers"`
+		Partitions []controller.PartitionAssignment `json:"partitions"`
+	}{Version: snapshot.Version}
+	for _, broker := range snapshot.Brokers {
+		view.Brokers = append(view.Brokers, broker)
+	}
+	for _, assignment := range snapshot.Partitions {
+		assignment.Replicas = append([]string(nil), assignment.Replicas...)
+		view.Partitions = append(view.Partitions, assignment)
+	}
+	sort.Slice(view.Brokers, func(i, j int) bool { return view.Brokers[i].ID < view.Brokers[j].ID })
+	sort.Slice(view.Partitions, func(i, j int) bool {
+		if view.Partitions[i].Key.Topic != view.Partitions[j].Key.Topic {
+			return view.Partitions[i].Key.Topic < view.Partitions[j].Key.Topic
+		}
+		return view.Partitions[i].Key.Partition < view.Partitions[j].Key.Partition
+	})
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(view); err != nil {
+		return
+	}
+}
+
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if s == nil || ctx == nil || listener == nil {
 		return errors.New("server, context, and listener are required")
@@ -462,6 +519,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 		if s.controllerRuntime != nil {
 			mux.HandleFunc("/controller/status", s.handleControllerStatus)
+			mux.HandleFunc("/controller/metadata", s.handleControllerMetadata)
 		}
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {

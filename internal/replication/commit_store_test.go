@@ -103,3 +103,57 @@ func TestCommitStoreRejectsCorruptState(t *testing.T) {
 		t.Fatalf("corrupt state error = %v, want ErrInvalidCommitState", err)
 	}
 }
+
+func TestCommitStoreUpdateLeaderPreservesWatermarkAndPersistsEpoch(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenCommitStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Initialize("orders", 0, 0, 5, "broker-1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Advance("orders", 0, 4, "broker-1", 1, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := store.UpdateLeader("orders", 0, "broker-2", 2, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.HighWatermark != 4 || updated.LeaderID != "broker-2" || updated.LeaderEpoch != 2 {
+		t.Fatalf("updated state = %+v, want watermark 4, leader broker-2, epoch 2", updated)
+	}
+
+	reopened, err := OpenCommitStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, ok := reopened.Get("orders", 0)
+	if !ok || recovered != updated {
+		t.Fatalf("recovered state=%+v exists=%t, want %+v", recovered, ok, updated)
+	}
+}
+
+func TestCommitStoreUpdateLeaderRejectsStaleEpochAndLogBehindWatermark(t *testing.T) {
+	store, err := OpenCommitStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Initialize("orders", 0, 0, 5, "broker-1", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Advance("orders", 0, 4, "broker-1", 2, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateLeader("orders", 0, "broker-2", 1, 5); !errors.Is(err, ErrCommitLeader) {
+		t.Fatalf("stale epoch error=%v, want ErrCommitLeader", err)
+	}
+	if _, err := store.UpdateLeader("orders", 0, "broker-2", 3, 3); !errors.Is(err, ErrCommitAheadOfLog) {
+		t.Fatalf("log-behind-watermark error=%v, want ErrCommitAheadOfLog", err)
+	}
+	state, ok := store.Get("orders", 0)
+	if !ok || state.LeaderID != "broker-1" || state.LeaderEpoch != 2 || state.HighWatermark != 4 {
+		t.Fatalf("failed update mutated commit state: %+v exists=%t", state, ok)
+	}
+}

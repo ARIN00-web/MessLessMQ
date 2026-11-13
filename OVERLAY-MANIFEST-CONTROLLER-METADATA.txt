@@ -1,0 +1,30 @@
+MessLessMQ controller-committed metadata overlay
+
+This overlay is intended for the already-updated MessLessMQ project containing:
+- integrated persistent broker runtime
+- seed-based membership discovery
+- inter-process synchronous replication and durable commit boundaries
+- durable fixed-voter controller election
+
+Contents are additive/replacement source files only. It does not include or replace:
+- .git/
+- go.mod or go.sum
+- any data directory
+
+New capabilities:
+- serialized controller metadata proposal path
+- majority commit and applied metadata snapshot
+- broker registration and initial partition assignment proposals
+- deterministic assignment bootstrap if REPLICA_ASSIGNMENTS is omitted
+- applied assignment registry used by METADATA and replication runtime
+- controller metadata HTTP endpoint
+- durable per-replica leader/epoch update
+- three-process controller metadata smoke test
+
+Important current boundaries:
+- fixed voter membership only
+- initial assignments only; no staged reassignment
+- no automatic partition-leader promotion or client rerouting yet
+- peer and admin listeners remain plaintext/unauthenticated
+
+Preserve the existing Go directive (Go 1.27.1) in go.mod.

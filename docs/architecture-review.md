@@ -28,7 +28,7 @@ Brokers join configured seeds and exchange in-memory membership snapshots. Broke
 
 ### Data replication
 
-The live runtime replicates record batches and commit markers over `internal/interbroker`. Replica assignments are static environment configuration; each ordered assignment's first broker is the fixed leader. `acks=all` requires MinISR durable data acknowledgements, persists the leader high watermark, then requires MinISR commit-marker acknowledgements. Consume hides offsets greater than or equal to the local persisted high watermark. The in-process `replication.Manager` is not instantiated across processes; the running server uses a separate transport adapter.
+The live runtime replicates record batches and commit markers over `internal/interbroker`. In controller mode, replica assignments come from the committed controller snapshot; initial assignments are derived from sorted fixed voter IDs or supplied as one identical explicit map on all brokers. Each ordered assignment's first broker is the fixed initial leader. `acks=all` requires MinISR durable data acknowledgements, persists the leader high watermark, then requires MinISR commit-marker acknowledgements. Consume hides offsets greater than or equal to the local persisted high watermark. The in-process `replication.Manager` is not instantiated across processes; the running server uses a separate transport adapter.
 
 A failed data quorum can leave uncommitted physical log tails. They are hidden from consumers, but automatic truncation/reconciliation is not implemented. An error 15 commit-marker quorum failure is an uncertain producer outcome because the leader watermark has already been persisted.
 
@@ -36,7 +36,7 @@ A failed data quorum can leave uncommitted physical log tails. They are hidden f
 
 The running broker can participate in a fixed-voter Raft controller election over the peer TCP transport. The voter list is explicit and identical across members. Elections use randomized timeouts and majority voting; leaders send AppendEntries heartbeats. Each controller persists term, vote, log, and commit index. On restart, role and leader identity are discarded and the voter rejoins as a follower. A three-process smoke test kills the elected controller leader, observes a replacement leader, restarts the old process from its original data directory, and verifies that it rejoins as a follower.
 
-This is currently **controller election and heartbeat durability**, not a complete controller-driven cluster metadata service. The server does not yet expose a proposal path for broker registration or partition assignment commands, and the runtime does not apply committed controller metadata to partition assignments. The controller leader is distinct from a partition leader. Controller election does not yet promote a new data-partition leader when the statically configured partition leader dies.
+The runtime now has a fixed-voter controller proposal path for broker registration and initial partition assignment. Proposals are replicated to a majority, committed under the current-term rule, and applied from the committed snapshot on each broker. `GET /controller/metadata` exposes the committed snapshot; the ordinary METADATA API and replication adapter use the applied assignment view. The controller leader is distinct from a partition leader. Controller election still does not promote a new data-partition leader when the statically assigned partition leader dies.
 
 ### Client and consumer APIs
 
@@ -65,10 +65,10 @@ A produce batch is not transactional. A disk error partway through a multi-recor
 - Docker image runs as a non-root user and writes below `/var/lib/messlessmq`.
 - Compose and Kubernetes configure one cluster ID, unique broker IDs, peer listeners, advertised peer addresses, seed discovery, and a fixed three-voter controller set.
 - Each broker has a distinct durable volume/PVC for logs, commit state, identity, and controller Raft state.
-- Default deployment manifests **do not** set `MESSLESSMQ_REPLICA_ASSIGNMENTS`; they run membership and controller election, but message replication is enabled only after identical static replica assignments and MinISR are configured on all brokers.
+- Default deployment manifests configure a fixed three-voter controller and `MESSLESSMQ_MIN_ISR=2`. When no explicit replica map is supplied, the elected controller commits a deterministic assignment containing all fixed voters for every bootstrap partition, with the initial leader rotated by partition ID.
 - Kubernetes TCP probes only show that the process accepts a connection; they do not establish data replication health, commit convergence, or controller quorum readiness.
 
-Persistent volumes protect each broker's local state where the storage provider honors the PVC. Static assignments enable synchronous record and commit-marker replication. The controller can elect a leader, but it cannot yet update assignments or promote partition leaders.
+Persistent volumes protect each broker's local state where the storage provider honors the PVC. Controller-committed replica assignments enable synchronous record and commit-marker replication. The controller commits initial broker registrations and partition assignments. It cannot yet perform a staged replica reassignment or automatically promote a replacement partition leader.
 
 ## 6. Strong engineering aspects
 
@@ -83,11 +83,10 @@ Persistent volumes protect each broker's local state where the storage provider 
 ## 7. Remaining work before a distributed production release
 
 1. Add authentication and TLS to inter-broker traffic, plus heartbeat/lease membership health and removal.
-2. Add a live controller proposal API for broker registration and partition assignments; replicate and commit those commands through the Raft log.
-3. Apply committed metadata on every broker and make it authoritative for replica assignments and leader epochs.
-4. Implement Raft per-peer replication progress/backtracking, current-term commit rules for actual metadata proposals, quorum-loss tests, and safe voter reconfiguration.
-5. Connect controller decisions to partition leader promotion, dynamic ISR removal, replica reassignment, catch-up, and safe old-leader fencing.
-6. Route produce/fetch clients to leaders using refreshed committed cluster metadata.
+2. Extend controller metadata commands with staged replica reassignment, partition leader promotion, and removal/fencing of unavailable replicas.
+3. Connect committed leader-epoch changes to replica catch-up verification, partition runtime leadership, and safe old-leader fencing.
+4. Improve Raft with per-peer replication progress/backtracking, follower snapshot/bootstrap, quorum-loss recovery, and safe voter reconfiguration.
+5. Route produce/fetch clients automatically using refreshed committed metadata and test leader changes end to end.
 7. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
 8. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a TLS-capable client.
 9. Define idempotency/retry semantics across partial appends, uncertain commit outcomes, and server restarts.
@@ -100,4 +99,4 @@ The codebase contains at-most-once, at-least-once, idempotent-producer, duplicat
 
 ## 9. Final assessment
 
-MessLessMQ has a persistent broker runtime, real inter-process synchronous record replication with durable commit markers under static assignments, and real fixed-voter controller elections with durable term/vote/log/commit state. It is not yet an autonomous distributed broker: controller metadata proposals do not drive partition assignments, and controller failover does not yet trigger data-partition leader promotion or client rerouting. It should not be presented as a production-ready Kafka replacement until those integration and security gaps are closed and tested end to end.
+MessLessMQ has a persistent broker runtime, real inter-process synchronous record replication with durable commit markers, fixed-voter controller elections with durable term/vote/log/commit state, and controller-committed broker registrations and initial partition assignments applied by each broker. It is not yet an autonomous fault-tolerant data cluster: partition leadership is not automatically promoted after failure, replica reassignment and dynamic ISR changes are not implemented, and clients do not automatically reroute after a leader change. It should not be presented as a production-ready Kafka replacement until those integration and security gaps are closed and tested end to end.

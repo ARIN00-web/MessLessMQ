@@ -33,3 +33,8 @@ The running server currently exercises elections and heartbeat exchange. The con
 1. Keep the in-memory `controller.Cluster`: rejected because it cannot survive process restart or coordinate real broker processes.
 2. Elect a controller based only on membership snapshots: rejected because membership presence does not provide durable majority voting or split-brain protection.
 3. Dynamically treat every discovered broker as a voter: rejected because adding voters without committed membership reconfiguration can change quorum rules inconsistently.
+
+
+## Follow-up decision
+
+The broker runtime proposal path and committed broker/partition metadata integration were added in ADR 0011. The limitations described above reflect the state when this ADR was first accepted; consult ADR 0011 and the current architecture review for the current runtime behavior. Partition leader promotion remains future work.

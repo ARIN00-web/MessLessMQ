@@ -11,6 +11,7 @@ import (
 
 	"github.com/ARIN00-web/messlessmq/internal/config"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/recordmeta"
 )
 
 func reserveAddress(t *testing.T) string {
@@ -152,5 +153,126 @@ func TestThreeServerProcessesDiscoverMembershipAndAdvertiseBrokers(t *testing.T)
 	}
 	if len(metadata.Partitions) != 1 || metadata.Partitions[0].Leader != "broker-2" || len(metadata.Partitions[0].Replicas) != 1 || metadata.Partitions[0].Replicas[0] != "broker-2" {
 		t.Fatalf("unexpected local partition metadata: %+v", metadata.Partitions)
+	}
+}
+
+func TestThreeServerProcessesCommitBrokerAndPartitionMetadata(t *testing.T) {
+	root := t.TempDir()
+	voters := []string{"broker-1", "broker-2", "broker-3"}
+	firstConfig := clusterConfig(t, root, "broker-1")
+	firstConfig.ControllerVoters = voters
+	first := startClusterRuntime(t, firstConfig, []TopicDefinition{{Name: "orders", Partitions: 3}})
+
+	secondConfig := clusterConfig(t, root, "broker-2", "broker-1@"+firstConfig.PeerAdvertiseAddress)
+	secondConfig.ControllerVoters = voters
+	second := startClusterRuntime(t, secondConfig, []TopicDefinition{{Name: "orders", Partitions: 3}})
+
+	thirdConfig := clusterConfig(t, root, "broker-3", "broker-1@"+firstConfig.PeerAdvertiseAddress, "broker-2@"+secondConfig.PeerAdvertiseAddress)
+	thirdConfig.ControllerVoters = voters
+	third := startClusterRuntime(t, thirdConfig, []TopicDefinition{{Name: "orders", Partitions: 3}})
+
+	servers := map[string]*Server{"broker-1": first, "broker-2": second, "broker-3": third}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		ready := true
+		for id, runtime := range servers {
+			metadata := runtime.controllerNode.Metadata()
+			if len(metadata.Brokers) != 3 || len(metadata.Partitions) != 3 || len(runtime.assignmentStore.snapshot()) != 3 {
+				ready = false
+				break
+			}
+			for _, brokerID := range voters {
+				if _, exists := metadata.Brokers[brokerID]; !exists {
+					ready = false
+					break
+				}
+			}
+			if !ready {
+				_ = id
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for id, runtime := range servers {
+		metadata := runtime.controllerNode.Metadata()
+		if len(metadata.Brokers) != 3 || len(metadata.Partitions) != 3 {
+			t.Fatalf("%s did not apply committed cluster metadata: brokers=%d partitions=%d status=%+v", id, len(metadata.Brokers), len(metadata.Partitions), runtime.controllerNode.Status())
+		}
+		if len(runtime.assignmentStore.snapshot()) != 3 {
+			t.Fatalf("%s did not publish committed assignments to data plane", id)
+		}
+	}
+
+	conn, err := net.DialTimeout("tcp", secondConfig.ListenAddress, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	metadataPayload, err := protocol.EncodeMetadataRequest(protocol.MetadataRequest{Topic: "orders"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataResponse := exchange(t, conn, protocol.Request{APIKey: protocol.APIMETADATA, APIVersion: protocol.MetadataAPIVersion, CorrelationID: 501, Payload: metadataPayload})
+	if metadataResponse.ErrorCode != protocol.ErrorNone {
+		t.Fatalf("metadata API returned error %d", metadataResponse.ErrorCode)
+	}
+	metadata, err := protocol.DecodeMetadataResponse(metadataResponse.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata.Brokers) != 3 || len(metadata.Partitions) != 3 {
+		t.Fatalf("metadata API did not expose committed view: %+v", metadata)
+	}
+
+	producePayload, err := protocol.EncodeProduceRequest(protocol.ProduceRequest{
+		AckMode: protocol.AckAll,
+		Batch:   protocol.MessageBatch{Messages: []protocol.Message{{Topic: "orders", Key: []byte("customer-7"), Value: []byte("controller-committed-order"), Timestamp: 22334}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaderConn, err := net.DialTimeout("tcp", firstConfig.ListenAddress, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer leaderConn.Close()
+	_ = leaderConn.SetDeadline(time.Now().Add(5 * time.Second))
+	produceResponse := exchange(t, leaderConn, protocol.Request{APIKey: protocol.APIPRODUCE, APIVersion: 1, CorrelationID: 502, Payload: producePayload})
+	if produceResponse.ErrorCode != protocol.ErrorNone {
+		t.Fatalf("produce through committed partition leader failed with code %d", produceResponse.ErrorCode)
+	}
+	appendResult, err := protocol.DecodeProduceResponse(produceResponse.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(appendResult.Records) != 1 || appendResult.Records[0].PartitionID != 0 || appendResult.Records[0].Offset != 0 {
+		t.Fatalf("unexpected append result: %+v", appendResult)
+	}
+
+	for id, runtime := range map[string]*Server{"broker-2": second, "broker-3": third} {
+		partitionTopic, err := runtime.registry.Get("orders")
+		if err != nil {
+			t.Fatal(err)
+		}
+		partition, err := partitionTopic.Partition(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, _, err := partition.ReadWithTimestamp(0)
+		if err != nil {
+			t.Fatalf("%s did not receive replicated record: %v", id, err)
+		}
+		decodedKey, decodedValue, _, err := recordmeta.DecodeMessage(stored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(decodedKey) != "customer-7" || string(decodedValue) != "controller-committed-order" {
+			t.Fatalf("%s has wrong replicated record: %+v", id, decodedValue)
+		}
 	}
 }

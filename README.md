@@ -2,7 +2,7 @@
 
 MessLessMQ is a from-scratch Go message broker project. Each broker process provides a persistent TCP data path with durable topics/partitions, PRODUCE, CONSUME, and METADATA APIs, a small CLI, optional TLS/mTLS, metrics, health endpoints, request limits, and graceful shutdown. An optional peer listener supports seed-based broker membership discovery and a fixed-voter, durable Raft controller election across independent processes.
 
-The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership, synchronous remote record replication, durable commit markers, and fixed-voter controller elections are now wired across independent processes. Partition assignments are still statically configured; controller metadata is not yet authoritative for assignment changes, and controller elections do not yet promote partition leaders in the data plane.
+The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership, synchronous remote record replication, durable commit markers, fixed-voter controller elections, and Raft-committed broker/partition metadata are wired across independent processes. Each broker applies only committed controller assignments to its live metadata and replication routing view. Partition leaders are still fixed by the committed initial assignment: automatic data-partition leader promotion, dynamic ISR changes, staged reassignment, and client rerouting remain future work.
 
 See [docs/architecture-review.md](docs/architecture-review.md) for the implemented boundary and remaining distributed-runtime work.
 
@@ -49,9 +49,9 @@ The producer routes keyed messages deterministically to a partition. With one pa
 | PRODUCE | 1 | Append messages and return topic, partition, and offset results |
 | CONSUME | 1 | Legacy value-only response |
 | CONSUME | 2 | Key/value response with timestamp and offsets |
-| METADATA | 1 | Known broker membership and statically configured partition replica/leader metadata |
+| METADATA | 1 | Broker and partition metadata applied from the committed controller snapshot when controller mode is enabled; otherwise local membership/configured assignment view |
 
-`acks=leader` synchronizes the local log before acknowledging. When static replica assignments are configured, `acks=all` waits for the configured MinISR data writes and durable commit-marker acknowledgements; without replica assignments it is local-only. A produce batch is not transactional if a storage error occurs after earlier records in the batch were appended.
+`acks=leader` synchronizes the local log before acknowledging. In controller mode, partition assignments are first committed through the fixed-voter Raft log and then used by the live replication path. `acks=all` waits for the assigned MinISR data writes, persists the leader high watermark, and requires MinISR durable commit-marker acknowledgements. Without controller voters or static replica assignments, the broker operates local-only. A produce batch is not transactional if a storage error occurs after earlier records in the batch were appended.
 
 ## Configuration
 
@@ -65,7 +65,7 @@ The broker reads environment variables prefixed with `MESSLESSMQ_`:
 | `DATA_DIR` | `./data` |
 | `BOOTSTRAP_TOPICS` | Empty; comma-separated `name:partition-count` entries |
 | `REPLICA_ASSIGNMENTS` | Optional static map such as `orders:0=broker-1,broker-2,broker-3;orders:1=broker-2,broker-3,broker-1` |
-| `MIN_ISR` | Minimum number of replicas required for `acks=all`; defaults to `1` |
+| `MIN_ISR` | Minimum number of replicas required for `acks=all`; defaults to `1` (the three-broker deployment manifests set it to `2`) |
 | `LOG_LEVEL` | `info` |
 | `MAX_CONNECTIONS` | `10000` |
 | `REQUEST_TIMEOUT` | `10s` |
@@ -95,6 +95,7 @@ With `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093`, the runtime exposes:
 - `GET /diagnostics`
 - `GET /metrics`
 - `GET /controller/status` (only when `CONTROLLER_VOTERS` is configured)
+- `GET /controller/metadata` (committed broker registrations and partition assignments)
 
 The management listener is separate from the binary client listener. Do not expose it to untrusted networks. When peer membership is enabled, it also exposes `GET /cluster/members`, which returns the local broker's current membership snapshot.
 
@@ -134,24 +135,24 @@ If `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093` is configured, inspect a broker's c
 For brokers with peer membership enabled, the broker persists `cluster_id` and `broker_id` in `<DATA_DIR>/metadata/identity.json`. Reusing that data directory with a different cluster or broker ID is rejected. Give every broker its own data directory/PVC. Peer join currently uses plaintext, unauthenticated TCP and has no heartbeat-based membership removal. Keep peer listeners on a trusted private network. Membership snapshots are per-process and in-memory; they are discovery information, not a consensus-committed controller view. The membership subsystem itself does not replicate records or elect partition leaders; those are separate runtime features described below.
 See [CLUSTER-MEMBERSHIP-GUIDE.md](CLUSTER-MEMBERSHIP-GUIDE.md) for a three-terminal local setup. `scripts/membership-smoke.sh` builds and launches three separate broker OS processes with isolated temporary data directories, then verifies that each admin membership endpoint reports all three brokers.
 
-## Static replication and controller elections
+## Controller-committed cluster metadata and replication
 
-To replicate a partition, configure the same static ordered replica assignment on every broker. The first broker is the fixed data leader. For example:
-
-```bash
-MESSLESSMQ_REPLICA_ASSIGNMENTS='orders:0=broker-1,broker-2,broker-3;orders:1=broker-2,broker-3,broker-1;orders:2=broker-3,broker-1,broker-2'
-MESSLESSMQ_MIN_ISR=2
-```
-
-To enable the separate fixed-voter controller, also configure the same voter list on every broker, including its own broker ID:
+To enable the distributed control plane, configure the same fixed voter list on every broker, including the local broker ID. Configure a shared cluster ID, unique broker IDs, peer listeners/advertised addresses, and seed peers as described above:
 
 ```bash
 MESSLESSMQ_CONTROLLER_VOTERS=broker-1,broker-2,broker-3
+MESSLESSMQ_MIN_ISR=2
 ```
 
-The controller persists term, vote, log, and commit index under `<DATA_DIR>/metadata/controller/raft-state.json`; controller roles are volatile and a restarted voter rejoins as a follower. `GET /controller/status` reports election state. The `ready` field means all configured voter IDs are visible in the local membership snapshot; it is not a general health or quorum-commit guarantee. The controller currently elects a controller leader and exchanges Raft heartbeats, but it does not yet commit runtime broker/partition assignment proposals or trigger data-partition leader changes. Data-plane replica leaders remain the first broker in the static assignment.
+If `MESSLESSMQ_REPLICA_ASSIGNMENTS` is supplied, every broker must use the same ordered map. The first replica is the initial partition leader. If no explicit map is supplied, the controller bootstrap derives a deterministic full-replica assignment from the sorted fixed voter IDs and rotates the initial leader by partition ID. This is a bootstrap policy, not a rack/load-aware placement algorithm.
 
-`scripts/replication-smoke.sh` verifies three-process record replication, durable commit markers, committed-read filtering, and MinISR behavior. `scripts/controller-election-smoke.sh` verifies a real three-process controller election, controller-leader process failure, replacement election, and restart of the old voter as a follower. See [CONTROLLER-ELECTION-GUIDE.md](CONTROLLER-ELECTION-GUIDE.md) for voter configuration, state persistence, and status inspection.
+After all configured voters are visible through membership, the elected controller leader proposes broker registrations and partition assignments through its Raft log. Assignments become authoritative only after a majority commits them. Every broker applies the committed snapshot to its metadata API and replication routing registry. `GET /controller/metadata` exposes the committed controller snapshot; the normal METADATA API exposes the broker/partition view used by clients. `GET /controller/status` reports local election state. Its `ready` field means voter IDs are visible in local membership; it does not guarantee that all controller metadata has been committed/applied.
+
+Controller term, vote, log, and commit index persist under `<DATA_DIR>/metadata/controller/raft-state.json`. A restarted voter comes back as a follower. Data replication uses independent per-broker commit stores under `<DATA_DIR>/metadata/commits/`; consumers hide offsets at or beyond their local exclusive high watermark.
+
+The controller currently commits initial broker registration and partition assignment metadata for a fixed voter set. Existing committed assignments are authoritative and startup reconciliation will not overwrite them. Partition leadership is still fixed by the committed initial assignment: automatic partition leader promotion, dynamic ISR removal, staged replica reassignment, and client-side automatic rerouting are not implemented yet. The current peer protocol is plaintext and unauthenticated; keep peer and admin listeners on trusted private networks.
+
+`scripts/controller-metadata-smoke.sh` starts three independent broker processes, verifies the committed broker and partition metadata on all voters, checks the normal METADATA API, and produces/consumes a record from both follower logs. `scripts/replication-smoke.sh` verifies durable record replication, commit markers, committed-read filtering, and MinISR behavior. `scripts/controller-election-smoke.sh` verifies controller-leader replacement after process failure and old-voter rejoin. See [CONTROLLER-ELECTION-GUIDE.md](CONTROLLER-ELECTION-GUIDE.md) and [CONTROLLER-METADATA-GUIDE.md](CONTROLLER-METADATA-GUIDE.md).
 
 ## Tests and validation
 
@@ -191,6 +192,10 @@ go vet ./...
 ./scripts/controller-election-smoke.sh
 ```
 
+```bash
+./scripts/controller-metadata-smoke.sh
+```
+
 `scripts/crash-restart.sh` requires `nc` and port `19092` to be free. It produces a synchronously acknowledged record, sends SIGKILL to the broker, restarts it on the same temporary data directory, and verifies the record is still readable. This tests local log durability/recovery, not replication.
 
 ## Docker Compose
@@ -199,7 +204,7 @@ go vet ./...
 docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
-The three services listen on host ports `19092`, `19093`, and `19094`. Each has a separate named data volume, seed-based membership discovery, and the same fixed three-voter controller set. Their admin endpoints are published only on loopback host ports `19101`, `19102`, and `19103`. Controller elections are active, but message replication still requires matching `MESSLESSMQ_REPLICA_ASSIGNMENTS` and `MESSLESSMQ_MIN_ISR` configuration on all three services. Inspect membership with `/cluster/members` and controller state with `/controller/status`.
+The three services listen on host ports `19092`, `19093`, and `19094`. Each has a separate named data volume, seed-based membership discovery, and the same fixed three-voter controller set. With no explicit replica map, the controller commits a deterministic full-replica assignment for each bootstrap topic partition; the manifests set `MESSLESSMQ_MIN_ISR=2`. Their admin endpoints are published only on loopback host ports `19101`, `19102`, and `19103`. Inspect membership with `/cluster/members`, controller state with `/controller/status`, and committed assignments with `/controller/metadata`.
 
 ## Kubernetes
 
@@ -231,9 +236,9 @@ The StatefulSet requests one 5Gi persistent volume claim per pod; the cluster mu
 - API-key authentication and ACL packages exist but are not wired into the live custom TCP request pipeline.
 - Runtime rate limiting is keyed by remote IP rather than authenticated principal.
 - Consumer group coordination and durable offset APIs exist as packages but are not exposed end-to-end through the public request protocol.
-- Remote record replication and durable commit markers work with static replica assignments, but assignments are not yet sourced from committed controller metadata.
-- A durable fixed-voter controller election runs across broker processes, but controller metadata proposals are not yet wired into the running broker.
-- Partition leader promotion, dynamic ISR changes, replica reassignment, and automatic client rerouting are not yet implemented.
+- Broker registrations and initial partition assignments are proposed, majority-committed, and applied from the fixed-voter controller log.
+- Remote record replication and durable commit markers use the committed assignment view when controller mode is enabled.
+- Partition leader promotion, dynamic ISR changes, staged replica reassignment, and automatic client rerouting are not yet implemented.
 - Peer RPCs are plaintext and unauthenticated; admin endpoints are unauthenticated and must remain private. Consumer-group membership and offset commit/fetch are not yet exposed as a complete wire protocol.
 
-Do not describe the current build as a production-ready replicated Kafka replacement. It is a functioning persistent broker with a statically configured multi-process replication path and fixed-voter controller elections; it still needs controller-driven partition failover, secure peer RPCs, and end-to-end client routing.
+Do not describe the current build as a production-ready replicated Kafka replacement. It is a functioning persistent broker cluster with fixed-voter controller elections, committed initial broker/partition metadata, and synchronous inter-process replication. It still needs safe controller-driven partition failover, secure peer RPCs, dynamic reassignment, and end-to-end client routing.

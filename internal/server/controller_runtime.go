@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,8 +35,10 @@ type controllerRuntime struct {
 	heartbeat   time.Duration
 	rpcTimeout  time.Duration
 
-	requestID atomic.Uint64
-	contact   chan struct{}
+	requestID  atomic.Uint64
+	contact    chan struct{}
+	proposalMu sync.Mutex
+	onCommit   func()
 }
 
 type ControllerRuntimeStatus struct {
@@ -220,6 +223,92 @@ func (r *controllerRuntime) campaign(parent context.Context) error {
 		return err
 	}
 	r.logger.Info("controller elected", "broker_id", r.brokerID, "term", request.Term, "votes", votes, "voters", len(r.voters))
+	// A current-term no-op is the Raft commit barrier for any valid older-term
+	// suffix inherited from the previous leader. It prevents the metadata
+	// reconciler from appending duplicate registrations over pending entries.
+	if err := r.Propose(parent, controller.Command{Type: controller.CommandNoop}); err != nil {
+		r.logger.Warn("controller elected but could not commit initial barrier", "broker_id", r.brokerID, "error", err)
+	}
+	r.sendHeartbeats(parent)
+	return nil
+}
+
+// Propose commits one metadata command through the live fixed-voter Raft
+// quorum. The leader persists its entry first, replicates it to a majority,
+// commits locally, then advertises the new commit index to followers.
+func (r *controllerRuntime) Propose(parent context.Context, command controller.Command) error {
+	if r == nil || r.node == nil || parent == nil {
+		return controller.ErrInvalidConfig
+	}
+	r.proposalMu.Lock()
+	defer r.proposalMu.Unlock()
+
+	initial := r.node.Status()
+	if initial.Role != controller.RoleLeader || initial.LeaderID != r.brokerID {
+		return controller.ErrNotLeader
+	}
+	entry, err := r.node.AppendLocal(command)
+	if err != nil {
+		return err
+	}
+	request := r.node.AppendRequest()
+	if request.Term != entry.Term || request.LeaderID != r.brokerID {
+		return controller.ErrNotLeader
+	}
+
+	type result struct {
+		peerID   string
+		response controller.AppendEntriesResponse
+		err      error
+	}
+	peers := r.peerIDs()
+	results := make(chan result, len(peers))
+	for _, peerID := range peers {
+		peerID := peerID
+		go func() {
+			var response controller.AppendEntriesResponse
+			err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response)
+			results <- result{peerID: peerID, response: response, err: err}
+		}()
+	}
+
+	replicated := 1 // the leader's own durable log entry
+	for range peers {
+		select {
+		case <-parent.Done():
+			return parent.Err()
+		case result := <-results:
+			if result.err != nil {
+				continue
+			}
+			if result.response.Term > request.Term {
+				if err := r.node.RecordVote(result.peerID, controller.VoteResponse{Term: result.response.Term}); err != nil {
+					return err
+				}
+				return controller.ErrNotLeader
+			}
+			if result.response.Success && result.response.Term == request.Term {
+				replicated++
+			}
+		}
+	}
+	if replicated < r.majority() {
+		return controller.ErrNoQuorum
+	}
+	current := r.node.Status()
+	if current.Role != controller.RoleLeader || current.Term != entry.Term {
+		return controller.ErrNotLeader
+	}
+	if err := r.node.CommitCurrentTermEntry(replicated); err != nil {
+		return err
+	}
+	if r.onCommit != nil {
+		r.onCommit()
+	}
+
+	// Followers learn the committed index from the next AppendEntries. Send it
+	// immediately rather than waiting for the periodic heartbeat; the regular
+	// heartbeat remains a retry path for temporarily unavailable followers.
 	r.sendHeartbeats(parent)
 	return nil
 }
