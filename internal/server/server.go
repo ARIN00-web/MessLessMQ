@@ -19,10 +19,12 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/broker"
 	"github.com/ARIN00-web/messlessmq/internal/config"
 	"github.com/ARIN00-web/messlessmq/internal/controller"
+	"github.com/ARIN00-web/messlessmq/internal/group"
 	"github.com/ARIN00-web/messlessmq/internal/interbroker"
 	"github.com/ARIN00-web/messlessmq/internal/membership"
 	"github.com/ARIN00-web/messlessmq/internal/network"
 	"github.com/ARIN00-web/messlessmq/internal/observability"
+	"github.com/ARIN00-web/messlessmq/internal/offsets"
 	"github.com/ARIN00-web/messlessmq/internal/operations"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 	"github.com/ARIN00-web/messlessmq/internal/replication"
@@ -60,8 +62,13 @@ type Server struct {
 	desiredAssignments map[partitionKey]partitionReplicaAssignment
 	replicator         *distributedAppender
 	commits            *replication.CommitStore
+	peerTransport      *interbroker.Transport
 	controllerNode     *controller.DurableNode
 	controllerRuntime  *controllerRuntime
+	groupCoordinator   *group.Coordinator
+	offsetStore        *offsets.Store
+	clientKeys         *security.KeyStore
+	clientAuthorizer   security.Authorizer
 	health             *observability.HealthChecker
 	diagnostics        *observability.Diagnostics
 
@@ -182,6 +189,7 @@ func New(options Options) (*Server, error) {
 
 	var members *membership.Registry
 	var seeds []membership.Seed
+	peerTransport := interbroker.NewTransport(5 * time.Second)
 	if cfg.PeerListenAddress != "" {
 		members, err = membership.NewRegistry(cfg.ClusterID, membership.Broker{
 			ID: cfg.BrokerID, ClientAddress: cfg.AdvertiseAddress, PeerAddress: cfg.PeerAdvertiseAddress,
@@ -194,6 +202,14 @@ func New(options Options) (*Server, error) {
 		if err != nil {
 			_ = closeTopics(opened)
 			return nil, err
+		}
+		if cfg.PeerTLSCertFile != "" {
+			peerTLS, tlsErr := security.LoadClientTLSWithCertificate(cfg.PeerTLSCAFile, "", cfg.PeerTLSCertFile, cfg.PeerTLSKeyFile)
+			if tlsErr != nil {
+				_ = closeTopics(opened)
+				return nil, fmt.Errorf("configure peer TLS client: %w", tlsErr)
+			}
+			peerTransport = interbroker.NewTLSTransport(5*time.Second, peerTLS)
 		}
 	}
 
@@ -220,6 +236,7 @@ func New(options Options) (*Server, error) {
 			_ = closeTopics(opened)
 			return nil, fmt.Errorf("initialize controller runtime: %w", err)
 		}
+		controllerRuntimeInstance.transport = peerTransport
 	}
 
 	dispatcher := broker.NewDispatcher(registry)
@@ -235,6 +252,7 @@ func New(options Options) (*Server, error) {
 		hasControllerAuthority = controllerRuntimeInstance.HasAuthority
 	}
 	distributed := newDistributedAppender(cfg.BrokerID, members, assignmentStore, controllerEnabled, cfg.MinISR, commits, hasControllerAuthority)
+	distributed.transport = peerTransport
 	dispatcher.SetPartitionAppendFunc(distributed.Append)
 	dispatcher.SetHighWatermarkLookup(func(topicName string, partitionID uint32) (uint64, error) {
 		state, exists := commits.Get(topicName, partitionID)
@@ -262,13 +280,45 @@ func New(options Options) (*Server, error) {
 		return nil, err
 	}
 
+	offsetStore, err := offsets.Open(cfg.DataDir)
+	if err != nil {
+		_ = closeTopics(opened)
+		return nil, fmt.Errorf("open consumer offset store: %w", err)
+	}
+	groupCoordinator, err := group.NewCoordinator(registry, offsetStore)
+	if err != nil {
+		_ = offsetStore.Close()
+		_ = closeTopics(opened)
+		return nil, fmt.Errorf("initialize consumer group coordinator: %w", err)
+	}
+	dispatcher.SetGroupHandler(broker.NewGroupHandler(groupCoordinator))
+	var clientKeys *security.KeyStore
+	var clientAuthorizer security.Authorizer
+	if cfg.ClientAPIKey != "" {
+		clientKeys = security.NewKeyStore()
+		if err := clientKeys.Add(cfg.ClientAPIKey, security.Principal{ID: "configured-client", Roles: []string{"client"}}, time.Time{}); err != nil {
+			_ = offsetStore.Close()
+			_ = closeTopics(opened)
+			return nil, err
+		}
+		acl := security.NewACLAuthorizer()
+		if err := configureClientACL(acl, cfg.ClientACL); err != nil {
+			_ = offsetStore.Close()
+			_ = closeTopics(opened)
+			return nil, err
+		}
+		clientAuthorizer = acl
+	}
 	server := &Server{
 		cfg: cfg, adminAddr: strings.TrimSpace(options.AdminAddress), logger: options.Logger,
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
 		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
 		assignmentStore: assignmentStore, desiredAssignments: assignments, replicator: distributed, commits: commits,
+		peerTransport:  peerTransport,
 		controllerNode: durableController, controllerRuntime: controllerRuntimeInstance, health: health,
+		groupCoordinator: groupCoordinator, offsetStore: offsetStore,
+		clientKeys: clientKeys, clientAuthorizer: clientAuthorizer,
 		diagnostics:   observability.NewDiagnostics(),
 		replicaHealth: make(map[replicaHealthKey]replicaHealthState),
 	}
@@ -332,6 +382,14 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	listener, err := net.Listen("tcp", s.cfg.PeerListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("listen on peer address %s: %w", s.cfg.PeerListenAddress, err)
+	}
+	if s.cfg.PeerTLSCertFile != "" {
+		peerTLS, tlsErr := security.LoadServerTLS(s.cfg.PeerTLSCertFile, s.cfg.PeerTLSKeyFile, s.cfg.PeerTLSCAFile, s.cfg.RequirePeerCert)
+		if tlsErr != nil {
+			_ = listener.Close()
+			return nil, fmt.Errorf("configure peer TLS server: %w", tlsErr)
+		}
+		listener = tls.NewListener(listener, peerTLS)
 	}
 	mux := interbroker.NewMux()
 	handler, err := membership.NewHandler(s.members)
@@ -404,7 +462,7 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	}
 
 	if len(s.seeds) > 0 {
-		transport := interbroker.NewTransport(2 * time.Second)
+		transport := s.peerTransport
 		deadline := time.NewTimer(s.cfg.PeerJoinTimeout)
 		defer deadline.Stop()
 		ticker := time.NewTicker(250 * time.Millisecond)
@@ -437,6 +495,9 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 	}
 	if s.replicator != nil && len(s.desiredAssignments) > 0 {
 		go s.runReplicaCatchup(runtimeCtx)
+	}
+	if s.groupCoordinator != nil {
+		go s.runGroupExpiration(runtimeCtx)
 	}
 	return stop, nil
 }
@@ -552,7 +613,29 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 				http.Error(w, "metrics unavailable", http.StatusInternalServerError)
 			}
 		})
-		adminServer = &http.Server{Handler: mux, ReadHeaderTimeout: 3 * time.Second}
+		var adminHandler http.Handler = mux
+		if s.cfg.AdminAPIKey != "" {
+			keys := security.NewKeyStore()
+			if err := keys.Add(s.cfg.AdminAPIKey, security.Principal{ID: "configured-admin", Roles: []string{"admin"}}, time.Time{}); err != nil {
+				_ = adminListener.Close()
+				_ = listener.Close()
+				closeErr := closeTopics(s.topics)
+				return errors.Join(fmt.Errorf("configure admin authentication: %w", err), closeErr)
+			}
+			authorizer := security.NewACLAuthorizer()
+			if err := authorizer.Grant("admin", "admin", "read"); err != nil {
+				_ = adminListener.Close()
+				_ = listener.Close()
+				closeErr := closeTopics(s.topics)
+				return errors.Join(fmt.Errorf("configure admin authorization: %w", err), closeErr)
+			}
+			protected := http.NewServeMux()
+			protected.Handle("/health/live", observability.LivenessHandler())
+			protected.Handle("/health/ready", s.health.ReadinessHandler())
+			protected.Handle("/", security.Protect(mux, keys, authorizer, "admin", "read"))
+			adminHandler = protected
+		}
+		adminServer = &http.Server{Handler: adminHandler, ReadHeaderTimeout: 3 * time.Second}
 		go func() {
 			if err := adminServer.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				s.logger.Error("admin server failed", "error", err)
@@ -600,7 +683,7 @@ acceptLoop:
 			defer wg.Done()
 			defer func() { <-sem; connsMu.Lock(); delete(conns, conn); connsMu.Unlock() }()
 			remote := remoteIdentity(conn.RemoteAddr())
-			dispatcher := &instrumentedDispatcher{next: s.dispatch, controls: s.controls, limiter: s.limiter, remote: remote, requests: s.requests, failures: s.failures, produced: s.produced, consumed: s.consumed, latency: s.latency}
+			dispatcher := &instrumentedDispatcher{next: s.dispatch, controls: s.controls, limiter: s.limiter, remote: remote, requests: s.requests, failures: s.failures, produced: s.produced, consumed: s.consumed, latency: s.latency, clientKeys: s.clientKeys, clientAuthorizer: s.clientAuthorizer}
 			network.HandleConnectionWithTimeouts(conn, dispatcher, shutdown, s.cfg.RequestTimeout, s.cfg.RequestTimeout)
 		}(conn)
 	}
@@ -629,6 +712,11 @@ acceptLoop:
 	}
 	if err := closeTopics(s.topics); err != nil {
 		runErr = errors.Join(runErr, err)
+	}
+	if s.offsetStore != nil {
+		if err := s.offsetStore.Close(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 	}
 	s.logger.Info("broker stopped", "broker_id", s.cfg.BrokerID)
 	return runErr
@@ -660,10 +748,37 @@ type instrumentedDispatcher struct {
 	remote                                 string
 	requests, failures, produced, consumed *observability.Counter
 	latency                                *observability.Histogram
+	clientKeys                             *security.KeyStore
+	clientAuthorizer                       security.Authorizer
 }
 
 type RequestDispatcher interface {
 	Dispatch(protocol.Request) ([]byte, error)
+}
+
+func (d *instrumentedDispatcher) AuthenticationRequired() bool {
+	return d != nil && d.clientKeys != nil
+}
+func (d *instrumentedDispatcher) AuthenticateConnection(token string) (security.Principal, error) {
+	if d == nil || d.clientKeys == nil {
+		return security.Principal{}, security.ErrInvalidCredential
+	}
+	return d.clientKeys.Authenticate(token)
+}
+func (d *instrumentedDispatcher) AuthorizeConnection(principal security.Principal, request protocol.Request) error {
+	if d == nil || d.clientAuthorizer == nil {
+		return security.ErrForbidden
+	}
+	topics, action, err := requestTopics(request)
+	if err != nil {
+		return err
+	}
+	for _, topic := range topics {
+		if !d.clientAuthorizer.Allowed(principal, topic, action) {
+			return security.ErrForbidden
+		}
+	}
+	return nil
 }
 
 func (d *instrumentedDispatcher) Dispatch(request protocol.Request) ([]byte, error) {

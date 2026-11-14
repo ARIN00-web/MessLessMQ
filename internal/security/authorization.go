@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+var ErrForbidden = errors.New("forbidden")
+
 type Permission struct {
 	Resource string
 	Action   string

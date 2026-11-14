@@ -9,11 +9,22 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/broker"
 	"github.com/ARIN00-web/messlessmq/internal/consumer"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/security"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
 type RequestDispatcher interface {
 	Dispatch(protocol.Request) ([]byte, error)
+}
+
+var errForbidden = errors.New("request forbidden")
+
+// ConnectionAuthenticator keeps credentials out of every normal request and
+// lets the transport maintain a principal for one TCP connection.
+type ConnectionAuthenticator interface {
+	AuthenticationRequired() bool
+	AuthenticateConnection(string) (security.Principal, error)
+	AuthorizeConnection(security.Principal, protocol.Request) error
 }
 
 func HandleConnection(conn net.Conn, dispatcher RequestDispatcher, shutdown <-chan struct{}) {
@@ -37,7 +48,8 @@ func HandleConnectionWithTimeouts(conn net.Conn, dispatcher RequestDispatcher, s
 		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 			return
 		}
-		if err := handleRequest(conn, dispatcher, writeTimeout); err != nil {
+		var principal security.Principal
+		if err := handleRequest(conn, dispatcher, writeTimeout, &principal); err != nil {
 			if errors.Is(err, io.EOF) || isTimeoutError(err) {
 				return
 			}
@@ -46,7 +58,7 @@ func HandleConnectionWithTimeouts(conn net.Conn, dispatcher RequestDispatcher, s
 	}
 }
 
-func handleRequest(conn net.Conn, dispatcher RequestDispatcher, writeTimeout time.Duration) error {
+func handleRequest(conn net.Conn, dispatcher RequestDispatcher, writeTimeout time.Duration, principal *security.Principal) error {
 	frame, err := ReadFrame(conn)
 	if err != nil {
 		return err
@@ -55,7 +67,35 @@ func handleRequest(conn net.Conn, dispatcher RequestDispatcher, writeTimeout tim
 	if err != nil {
 		return err
 	}
-	responsePayload, dispatchErr := dispatcher.Dispatch(request)
+	var responsePayload []byte
+	var dispatchErr error
+	if authenticator, ok := dispatcher.(ConnectionAuthenticator); ok {
+		if request.APIKey == protocol.APIAUTH {
+			if request.APIVersion != protocol.AuthAPIVersion {
+				dispatchErr = protocol.ErrUnsupportedVersion
+			} else {
+				var auth protocol.AuthRequest
+				auth, dispatchErr = protocol.DecodeAuthRequest(request.Payload)
+				if dispatchErr == nil {
+					*principal, dispatchErr = authenticator.AuthenticateConnection(auth.Token)
+				}
+				if dispatchErr == nil {
+					responsePayload, dispatchErr = protocol.EncodeAuthResponse(protocol.AuthResponse{PrincipalID: principal.ID})
+				}
+			}
+		} else if authenticator.AuthenticationRequired() && principal.ID == "" {
+			dispatchErr = security.ErrInvalidCredential
+		} else if principal.ID != "" {
+			dispatchErr = authenticator.AuthorizeConnection(*principal, request)
+			if dispatchErr == nil {
+				responsePayload, dispatchErr = dispatcher.Dispatch(request)
+			}
+		} else {
+			responsePayload, dispatchErr = dispatcher.Dispatch(request)
+		}
+	} else {
+		responsePayload, dispatchErr = dispatcher.Dispatch(request)
+	}
 	response := protocol.Response{
 		APIKey: request.APIKey, APIVersion: request.APIVersion,
 		CorrelationID: request.CorrelationID,
@@ -113,6 +153,12 @@ func errorCodeFromError(err error) uint16 {
 	}
 	if errors.Is(err, protocol.ErrControllerAuthorityUnavailable) {
 		return protocol.ErrorControllerAuthorityUnavailable
+	}
+	if errors.Is(err, security.ErrInvalidCredential) || errors.Is(err, security.ErrExpiredCredential) {
+		return protocol.ErrorUnauthorized
+	}
+	if errors.Is(err, errForbidden) || errors.Is(err, security.ErrForbidden) {
+		return protocol.ErrorForbidden
 	}
 	if errors.Is(err, topic.ErrTopicNotFound) {
 		return protocol.ErrorUnknownTopic

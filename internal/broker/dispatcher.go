@@ -18,6 +18,7 @@ type Dispatcher struct {
 	metadataMu      sync.RWMutex
 	produceHandler  Handler
 	consumeHandler  Handler
+	groupHandler    Handler
 	metadataHandler Handler
 }
 
@@ -66,6 +67,15 @@ func (d *Dispatcher) SetMetadataHandler(handler Handler) {
 	d.metadataMu.Unlock()
 }
 
+func (d *Dispatcher) SetGroupHandler(handler Handler) {
+	if d == nil {
+		return
+	}
+	d.metadataMu.Lock()
+	d.groupHandler = handler
+	d.metadataMu.Unlock()
+}
+
 func (d *Dispatcher) Dispatch(req protocol.Request) ([]byte, error) {
 	if d == nil {
 		return nil, fmt.Errorf("%w: nil dispatcher", protocol.ErrInvalidRequest)
@@ -78,6 +88,14 @@ func (d *Dispatcher) Dispatch(req protocol.Request) ([]byte, error) {
 	case protocol.APIMETADATA:
 		d.metadataMu.RLock()
 		handler := d.metadataHandler
+		d.metadataMu.RUnlock()
+		if handler == nil {
+			return nil, ErrHandlerUnavailable
+		}
+		return handler.Handle(req)
+	case protocol.APIGROUP:
+		d.metadataMu.RLock()
+		handler := d.groupHandler
 		d.metadataMu.RUnlock()
 		if handler == nil {
 			return nil, ErrHandlerUnavailable

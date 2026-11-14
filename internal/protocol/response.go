@@ -19,6 +19,8 @@ const (
 	ErrorCommitUncertain                uint16 = 15
 	ErrorControllerAuthorityUnavailable uint16 = 16
 	ErrorClusterMetadataUnavailable     uint16 = 16
+	ErrorUnauthorized                   uint16 = 17
+	ErrorForbidden                      uint16 = 18
 )
 
 type Response struct {

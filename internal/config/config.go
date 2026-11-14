@@ -25,6 +25,13 @@ type Config struct {
 	TLSClientCertFile    string
 	TLSClientKeyFile     string
 	RequireClientCert    bool
+	PeerTLSCertFile      string
+	PeerTLSKeyFile       string
+	PeerTLSCAFile        string
+	RequirePeerCert      bool
+	AdminAPIKey          string
+	ClientAPIKey         string
+	ClientACL            string
 	RateLimitPerSecond   float64
 	RateLimitBurst       int
 	ClusterID            string
@@ -81,6 +88,12 @@ func Load(getenv LookupEnv) (Config, error) {
 	readString("TLS_CLIENT_CA_FILE", &cfg.TLSClientCAFile)
 	readString("TLS_CLIENT_CERT_FILE", &cfg.TLSClientCertFile)
 	readString("TLS_CLIENT_KEY_FILE", &cfg.TLSClientKeyFile)
+	readString("PEER_TLS_CERT_FILE", &cfg.PeerTLSCertFile)
+	readString("PEER_TLS_KEY_FILE", &cfg.PeerTLSKeyFile)
+	readString("PEER_TLS_CA_FILE", &cfg.PeerTLSCAFile)
+	readString("ADMIN_API_KEY", &cfg.AdminAPIKey)
+	readString("CLIENT_API_KEY", &cfg.ClientAPIKey)
+	readString("CLIENT_ACL", &cfg.ClientACL)
 	readString("CLUSTER_ID", &cfg.ClusterID)
 	readString("PEER_LISTEN_ADDRESS", &cfg.PeerListenAddress)
 	readString("PEER_ADVERTISE_ADDRESS", &cfg.PeerAdvertiseAddress)
@@ -133,6 +146,9 @@ func Load(getenv LookupEnv) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.RequireClientCert, err = boolValue(getenv, "REQUIRE_CLIENT_CERT", cfg.RequireClientCert); err != nil {
+		return Config{}, err
+	}
+	if cfg.RequirePeerCert, err = boolValue(getenv, "REQUIRE_PEER_CERT", cfg.RequirePeerCert); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -312,6 +328,15 @@ func (c Config) Validate() error {
 	}
 	if c.RequireClientCert && (c.TLSCertFile == "" || c.TLSClientCAFile == "") {
 		problems = append(problems, "mutual TLS requires server certificate, key, and client CA")
+	}
+	if (c.PeerTLSCertFile == "") != (c.PeerTLSKeyFile == "") {
+		problems = append(problems, "peer TLS certificate and key must be configured together")
+	}
+	if c.PeerTLSCAFile != "" && c.PeerTLSCertFile == "" {
+		problems = append(problems, "peer TLS CA requires peer TLS certificate and key")
+	}
+	if c.RequirePeerCert && (c.PeerTLSCertFile == "" || c.PeerTLSCAFile == "") {
+		problems = append(problems, "peer mutual TLS requires peer certificate, key, and CA")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

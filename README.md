@@ -51,6 +51,7 @@ The CLI producer automatically fetches METADATA and routes records to the commit
 | CONSUME | 1 | Legacy value-only response |
 | CONSUME | 2 | Key/value response with timestamp and offsets |
 | METADATA | 1 | Broker and partition metadata applied from the committed controller snapshot when controller mode is enabled; otherwise local membership/configured assignment view |
+| GROUP | 1 | Join, heartbeat, leave, owned-partition fetch, durable offset commit, and offset fetch |
 
 `acks=leader` synchronizes the local log before acknowledging. In controller mode, partition assignments are first committed through the fixed-voter Raft log and then used by the live replication path. `acks=all` waits for the assigned MinISR data writes, persists the leader high watermark, and requires MinISR durable commit-marker acknowledgements. Without controller voters or static replica assignments, the broker operates local-only. A produce batch is not transactional if a storage error occurs after earlier records in the batch were appended.
 
@@ -83,7 +84,12 @@ The broker reads environment variables prefixed with `MESSLESSMQ_`:
 | `HEARTBEAT_INTERVAL` | Controller heartbeat interval; default `200ms` and must be less than half the minimum election timeout |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | Optional server TLS certificate/key pair |
 | `TLS_CLIENT_CA_FILE`, `REQUIRE_CLIENT_CERT` | Optional mutual TLS client verification |
-| `ADMIN_ADDRESS` | Optional separate HTTP health/metrics listener; bind privately because it has no authentication middleware |
+| `PEER_TLS_CERT_FILE`, `PEER_TLS_KEY_FILE`, `PEER_TLS_CA_FILE` | Optional TLS certificate/key and trust CA for inter-broker traffic |
+| `REQUIRE_PEER_CERT` | Require and verify a client certificate on the peer listener; requires peer TLS certificate/key and CA |
+| `ADMIN_ADDRESS` | Optional separate HTTP health/metrics listener; bind privately even when an API key is configured |
+| `ADMIN_API_KEY` | Optional Bearer token protecting admin/diagnostic routes; health probes remain unauthenticated |
+| `CLIENT_API_KEY` | Optional binary TCP AUTH token; clients must authenticate once per connection before normal requests |
+| `CLIENT_ACL` | Optional semicolon-separated `role:topic:action` rules, e.g. `client:orders:produce;client:orders:consume` |
 
 For TLS, configure `TLS_CERT_FILE` and `TLS_KEY_FILE`. For mTLS, also configure `TLS_CLIENT_CA_FILE` and set `REQUIRE_CLIENT_CERT=true`. The included CLI currently supports plaintext TCP only; use a TLS-capable client for a TLS-enabled listener.
 

@@ -18,8 +18,8 @@ The audit found that `internal/replication.Manager` had dynamic ISR behavior, wh
 
 1. Reassignment: durable staged-plan persistence, controller-persisted intent, staged union placement, background catch-up, ISR admission, and finalization endpoints are implemented. Remaining: multi-process interrupted-reassignment and divergent-replica rebootstrap coverage.
 2. Client library: completed reusable producer/consumer APIs with metadata TTL, round-robin unkeyed placement, bounded retry and explicit uncertain-append errors. The CLI producer uses it; next, add TLS connection support.
-3. Consumer groups: versioned join, heartbeat, leave, offset commit/fetch APIs and durable coordinator state.
-4. Security: TLS/mTLS and identity verification for peer transport, then request-pipeline authentication and ACL enforcement.
+3. Consumer groups: GROUP v1 join, heartbeat, leave, owned fetch, offset commit/fetch, durable offsets, and session expiry are implemented. Remaining: controller-selected/recoverable coordinator placement and multi-process group tests.
+4. Security: optional TLS/mTLS is integrated for peer transport; binary AUTH and topic ACL enforcement are integrated. Remaining work is certificate-subject-to-broker identity verification, multi-principal credential management, and certificate rotation automation.
 5. Controller hardening: per-follower replication progress/backtracking, snapshot installation/compaction, and deterministic partition fault tests.
 6. Operations: controller APIs for topic/reassignment status, peer-authenticated admin controls, lag/ISR metrics, and deployment security defaults.
 

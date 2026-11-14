@@ -267,7 +267,11 @@ func (s *Server) queryPartitionReplicaStatus(ctx context.Context, brokerID strin
 		return replicationStatusResponse{}, err
 	}
 	requestID := partitionStatusRequestSequence.Add(1)
-	response, err := partitionStatusTransport.RoundTrip(ctx, peer.PeerAddress, interbroker.Envelope{
+	transport := s.peerTransport
+	if transport == nil {
+		transport = interbroker.NewTransport(partitionProbeTimeout)
+	}
+	response, err := transport.RoundTrip(ctx, peer.PeerAddress, interbroker.Envelope{
 		Type: interbroker.MessagePartitionStatus, RequestID: requestID,
 		SourceID: s.cfg.BrokerID, TargetID: brokerID, Payload: payload,
 	})
@@ -284,5 +288,4 @@ func (s *Server) queryPartitionReplicaStatus(ctx context.Context, brokerID strin
 	return status, nil
 }
 
-var partitionStatusTransport = interbroker.NewTransport(partitionProbeTimeout)
 var partitionStatusRequestSequence atomic.Uint64

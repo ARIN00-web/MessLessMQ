@@ -2,11 +2,13 @@ package interbroker
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -17,8 +19,20 @@ type RemoteError struct{ Message string }
 func (e *RemoteError) Error() string { return "interbroker remote error: " + e.Message }
 
 type Transport struct {
-	Dialer  net.Dialer
-	Timeout time.Duration
+	Dialer    net.Dialer
+	Timeout   time.Duration
+	TLSConfig *tls.Config
+}
+
+// NewTLSTransport creates a peer transport that authenticates and encrypts
+// every RPC. The caller owns certificate/CA loading; the config is cloned so
+// later caller mutation cannot race active peer requests.
+func NewTLSTransport(timeout time.Duration, config *tls.Config) *Transport {
+	transport := NewTransport(timeout)
+	if config != nil {
+		transport.TLSConfig = config.Clone()
+	}
+	return transport
 }
 
 func NewTransport(timeout time.Duration) *Transport {
@@ -43,7 +57,7 @@ func (t *Transport) RoundTrip(ctx context.Context, address string, request Envel
 	}
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stopClose()
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	timeout := t.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -54,6 +68,21 @@ func (t *Transport) RoundTrip(ctx context.Context, address string, request Envel
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		return Envelope{}, err
+	}
+	if t.TLSConfig != nil {
+		config := t.TLSConfig.Clone()
+		if config.ServerName == "" {
+			host, _, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return Envelope{}, fmt.Errorf("parse TLS peer address %q: %w", address, splitErr)
+			}
+			config.ServerName = strings.Trim(host, "[]")
+		}
+		tlsConn := tls.Client(conn, config)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			return Envelope{}, fmt.Errorf("TLS handshake with peer %q: %w", address, err)
+		}
+		conn = tlsConn
 	}
 	if err := writeFrame(conn, request); err != nil {
 		return Envelope{}, fmt.Errorf("write peer request: %w", err)
