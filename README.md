@@ -40,13 +40,14 @@ go run ./cmd/client produce -addr 127.0.0.1:9092 -topic orders -key customer-7 -
 go run ./cmd/client consume -addr 127.0.0.1:9092 -topic orders -partition 0 -offset 0 -max 10
 ```
 
-The CLI producer automatically fetches METADATA and routes keyed messages to the committed partition leader. It mirrors the broker's FNV-1a key partitioner and refreshes metadata once after a stale-leader/authority response. Unkeyed produce is not automatically routed because its partition selection is broker-local round robin. With one partition, every message routes to partition zero.
+The CLI producer automatically fetches METADATA and routes records to the committed partition leader. It mirrors the broker's FNV-1a key partitioner for keyed records and uses client-side round robin plus PRODUCE v2 for unkeyed records. It refreshes metadata once after a stale-leader/authority response. Set `-auto-route=false` for direct diagnostic writes.
 
 ## API versions
 
 | API | Version | Behavior |
 |---|---:|---|
-| PRODUCE | 1 | Append messages and return topic, partition, and offset results |
+| PRODUCE | 1 | Backward-compatible broker-side partition selection |
+| PRODUCE | 2 | Explicit client-selected partition; one message per request |
 | CONSUME | 1 | Legacy value-only response |
 | CONSUME | 2 | Key/value response with timestamp and offsets |
 | METADATA | 1 | Broker and partition metadata applied from the committed controller snapshot when controller mode is enabled; otherwise local membership/configured assignment view |

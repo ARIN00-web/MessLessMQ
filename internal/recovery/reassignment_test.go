@@ -232,3 +232,30 @@ func TestReassignmentRejectsMissingPlanAndInvalidState(t *testing.T) {
 		t.Fatalf("expected invalid plan state, got %v", err)
 	}
 }
+
+func TestReassignmentPlansPersistAcrossCoordinatorRestart(t *testing.T) {
+	manager := newClusterManager(t)
+	directory := t.TempDir()
+	coordinator, err := OpenReassignmentCoordinator(manager, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := coordinator.Begin("orders", 0, []string{"broker-b", "broker-c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := OpenReassignmentCoordinator(manager, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := restarted.Plan(plan.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.State != ReassignmentPlanned || restored.Key != plan.Key || restored.SourceLeader != "broker-a" {
+		t.Fatalf("restored plan = %+v", restored)
+	}
+	if _, err := restarted.Begin("orders", 0, []string{"broker-a", "broker-c"}); !errors.Is(err, ErrPlanExists) {
+		t.Fatalf("restored active plan did not prevent conflict: %v", err)
+	}
+}

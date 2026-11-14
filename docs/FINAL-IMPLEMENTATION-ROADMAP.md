@@ -16,8 +16,8 @@ The audit found that `internal/replication.Manager` had dynamic ISR behavior, wh
 
 ## Next implementation stages
 
-1. Reassignment: persist a staged assignment, bootstrap a new copy from an authoritative leader, verify committed prefix, then switch active placement through the controller.
-2. Client library: reusable producer/consumer APIs with metadata TTL, round-robin unkeyed placement, bounded retry and explicit uncertain-append errors.
+1. Reassignment: durable staged-plan persistence and restart restoration are complete in `internal/recovery`; next, bootstrap a new copy from an authoritative live leader and expose the controller-coordinated workflow through the broker runtime.
+2. Client library: completed reusable producer/consumer APIs with metadata TTL, round-robin unkeyed placement, bounded retry and explicit uncertain-append errors. The CLI producer uses it; next, add TLS connection support.
 3. Consumer groups: versioned join, heartbeat, leave, offset commit/fetch APIs and durable coordinator state.
 4. Security: TLS/mTLS and identity verification for peer transport, then request-pipeline authentication and ACL enforcement.
 5. Controller hardening: per-follower replication progress/backtracking, snapshot installation/compaction, and deterministic partition fault tests.

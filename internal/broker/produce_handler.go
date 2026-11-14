@@ -66,12 +66,24 @@ func (h *ProduceHandler) Handle(req protocol.Request) ([]byte, error) {
 	if req.APIKey != protocol.APIPRODUCE {
 		return nil, fmt.Errorf("expected PRODUCE API key: %w", protocol.ErrInvalidRequest)
 	}
-	if req.APIVersion != ProduceAPIVersion {
+	if req.APIVersion != ProduceAPIVersion && req.APIVersion != protocol.ProduceAPIVersion2 {
 		return nil, fmt.Errorf("produce API version %d: %w", req.APIVersion, protocol.ErrUnsupportedVersion)
 	}
-	produceRequest, err := protocol.DecodeProduceRequest(req.Payload)
-	if err != nil {
-		return nil, err
+	var produceRequest protocol.ProduceRequest
+	var explicitPartition *uint32
+	var err error
+	if req.APIVersion == protocol.ProduceAPIVersion2 {
+		v2, err := protocol.DecodeProduceRequestV2(req.Payload)
+		if err != nil {
+			return nil, err
+		}
+		produceRequest = v2.Request
+		explicitPartition = &v2.PartitionID
+	} else {
+		produceRequest, err = protocol.DecodeProduceRequest(req.Payload)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Resolve and validate the entire batch before the first append. Storage
@@ -82,13 +94,24 @@ func (h *ProduceHandler) Handle(req protocol.Request) ([]byte, error) {
 		if getErr != nil {
 			return nil, fmt.Errorf("message %d topic %q: %w", i, message.Topic, getErr)
 		}
-		assignment, assignmentErr := h.assignmentFor(registeredTopic)
-		if assignmentErr != nil {
-			return nil, fmt.Errorf("message %d partition assignment: %w", i, assignmentErr)
-		}
-		partition, assignErr := assignment.Assign(message.Key)
-		if assignErr != nil {
-			return nil, fmt.Errorf("message %d partition routing: %w", i, assignErr)
+		var partition *topic.Partition
+		if explicitPartition != nil {
+			if len(produceRequest.Batch.Messages) != 1 {
+				return nil, fmt.Errorf("explicit partition produce supports exactly one message: %w", protocol.ErrInvalidRequest)
+			}
+			partition, err = registeredTopic.Partition(*explicitPartition)
+			if err != nil {
+				return nil, fmt.Errorf("message %d explicit partition: %w", i, err)
+			}
+		} else {
+			assignment, assignmentErr := h.assignmentFor(registeredTopic)
+			if assignmentErr != nil {
+				return nil, fmt.Errorf("message %d partition assignment: %w", i, assignmentErr)
+			}
+			partition, err = assignment.Assign(message.Key)
+			if err != nil {
+				return nil, fmt.Errorf("message %d partition routing: %w", i, err)
+			}
 		}
 		if message.Timestamp <= 0 {
 			message.Timestamp = time.Now().UnixMilli()

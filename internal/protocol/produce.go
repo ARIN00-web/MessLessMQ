@@ -7,6 +7,8 @@ import (
 
 const producePayloadHeaderSize = 6
 
+const ProduceAPIVersion2 uint16 = 2
+
 type ProduceRequest struct {
 	AckMode AckMode
 	Batch   MessageBatch
@@ -90,4 +92,35 @@ func DecodeProduceRequest(data []byte) (ProduceRequest, error) {
 		AckMode: ackMode,
 		Batch:   batch,
 	}, nil
+}
+
+// ProduceRequestV2 makes the target partition explicit. It is used by
+// cluster-aware clients so an unkeyed record can be routed to a selected
+// partition leader instead of relying on each broker's local round-robin
+// cursor. Its payload is [PartitionID:4][Produce v1 payload].
+type ProduceRequestV2 struct {
+	PartitionID uint32
+	Request     ProduceRequest
+}
+
+func EncodeProduceRequestV2(req ProduceRequestV2) ([]byte, error) {
+	v1, err := EncodeProduceRequest(req.Request)
+	if err != nil {
+		return nil, err
+	}
+	data := make([]byte, 4+len(v1))
+	binary.BigEndian.PutUint32(data[:4], req.PartitionID)
+	copy(data[4:], v1)
+	return data, nil
+}
+
+func DecodeProduceRequestV2(data []byte) (ProduceRequestV2, error) {
+	if len(data) < 4 {
+		return ProduceRequestV2{}, ErrInvalidRequest
+	}
+	request, err := DecodeProduceRequest(data[4:])
+	if err != nil {
+		return ProduceRequestV2{}, err
+	}
+	return ProduceRequestV2{PartitionID: binary.BigEndian.Uint32(data[:4]), Request: request}, nil
 }

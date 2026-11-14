@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/ARIN00-web/messlessmq/internal/network"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	mqclient "github.com/ARIN00-web/messlessmq/mqclient"
 )
 
 func main() {
@@ -185,6 +187,18 @@ func runProduce(args []string) error {
 			return fmt.Errorf("resolve partition leader: %w", err)
 		}
 		fmt.Printf("routing topic=%s partition=%d leader_address=%s\n", topicName, routedPartition, targetAddress)
+	}
+	if autoRoute {
+		clusterClient, clientErr := mqclient.New(mqclient.Config{Bootstrap: []string{address}, Timeout: 10 * time.Second, MaxRetries: 1})
+		if clientErr != nil {
+			return clientErr
+		}
+		result, produceErr := clusterClient.Produce(context.Background(), mqclient.ProduceRequest{Topic: topicName, Key: messageKey, Value: []byte(value), Timestamp: time.Now().UnixMilli(), AckMode: ack})
+		if produceErr != nil {
+			return produceErr
+		}
+		fmt.Printf("appended topic=%s partition=%d offset=%d\n", result.Topic, result.PartitionID, result.Offset)
+		return nil
 	}
 	response, err := request(targetAddress, protocol.APIPRODUCE, 1, payload)
 	if err != nil && autoRoute && len(messageKey) > 0 {

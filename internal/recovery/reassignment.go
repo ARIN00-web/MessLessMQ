@@ -1,8 +1,11 @@
 package recovery
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -81,6 +84,7 @@ type ReassignmentCoordinator struct {
 	plans    map[string]ReassignmentPlan
 	active   map[controller.PartitionKey]string
 	nextPlan uint64
+	store    *reassignmentStore
 }
 
 func NewReassignmentCoordinator(manager *cluster.Manager) (*ReassignmentCoordinator, error) {
@@ -92,6 +96,40 @@ func NewReassignmentCoordinator(manager *cluster.Manager) (*ReassignmentCoordina
 		plans:   make(map[string]ReassignmentPlan),
 		active:  make(map[controller.PartitionKey]string),
 	}, nil
+}
+
+// OpenReassignmentCoordinator restores durable reassignment plans. A plan
+// persisted while its metadata proposal was in flight is marked uncertain:
+// callers must inspect committed controller metadata rather than blindly
+// retrying a potentially committed assignment.
+func OpenReassignmentCoordinator(manager *cluster.Manager, directory string) (*ReassignmentCoordinator, error) {
+	if manager == nil || manager.ControllerCluster() == nil || directory == "" {
+		return nil, ErrInvalidConfig
+	}
+	store, state, err := openReassignmentStore(directory)
+	if err != nil {
+		return nil, err
+	}
+	coordinator := &ReassignmentCoordinator{manager: manager, plans: make(map[string]ReassignmentPlan), active: make(map[controller.PartitionKey]string), nextPlan: state.NextPlan, store: store}
+	for id, plan := range state.Plans {
+		if id != plan.ID || plan.ID == "" {
+			return nil, fmt.Errorf("invalid persisted reassignment plan: %w", ErrInvalidConfig)
+		}
+		if plan.State == ReassignmentCommitting {
+			plan.State = ReassignmentCommitUncertain
+		}
+		coordinator.plans[id] = clonePlan(plan)
+		if plan.State == ReassignmentPlanned || plan.State == ReassignmentCommitUncertain {
+			if _, exists := coordinator.active[plan.Key]; exists {
+				return nil, fmt.Errorf("duplicate active reassignment for %s/%d: %w", plan.Key.Topic, plan.Key.Partition, ErrInvalidConfig)
+			}
+			coordinator.active[plan.Key] = plan.ID
+		}
+	}
+	if err := coordinator.persistLocked(); err != nil {
+		return nil, err
+	}
+	return coordinator, nil
 }
 
 func (c *ReassignmentCoordinator) Begin(topic string, partition int, targetReplicas []string) (ReassignmentPlan, error) {
@@ -147,6 +185,11 @@ func (c *ReassignmentCoordinator) Begin(topic string, partition int, targetRepli
 	}
 	c.plans[plan.ID] = clonePlan(plan)
 	c.active[key] = plan.ID
+	if err := c.persistLocked(); err != nil {
+		delete(c.plans, plan.ID)
+		delete(c.active, key)
+		return ReassignmentPlan{}, err
+	}
 	return clonePlan(plan), nil
 }
 
@@ -170,6 +213,10 @@ func (c *ReassignmentCoordinator) Complete(planID string, provider ReplicaReadin
 	}
 	plan.State = ReassignmentCommitting
 	c.plans[planID] = plan
+	if err := c.persistLocked(); err != nil {
+		c.mu.Unlock()
+		return ReassignmentPlan{}, err
+	}
 	c.mu.Unlock()
 
 	resetToPlanned := func(err error) (ReassignmentPlan, error) {
@@ -177,6 +224,7 @@ func (c *ReassignmentCoordinator) Complete(planID string, provider ReplicaReadin
 		if current, ok := c.plans[planID]; ok && current.State == ReassignmentCommitting {
 			current.State = ReassignmentPlanned
 			c.plans[planID] = current
+			_ = c.persistLocked()
 		}
 		c.mu.Unlock()
 		return ReassignmentPlan{}, err
@@ -186,6 +234,7 @@ func (c *ReassignmentCoordinator) Complete(planID string, provider ReplicaReadin
 		if current, ok := c.plans[planID]; ok {
 			current.State = ReassignmentCommitUncertain
 			c.plans[planID] = current
+			_ = c.persistLocked()
 		}
 		c.mu.Unlock()
 		return ReassignmentPlan{}, err
@@ -256,6 +305,10 @@ func (c *ReassignmentCoordinator) Complete(planID string, provider ReplicaReadin
 	completed.State = ReassignmentCompleted
 	c.plans[planID] = completed
 	delete(c.active, plan.Key)
+	if err := c.persistLocked(); err != nil {
+		c.mu.Unlock()
+		return ReassignmentPlan{}, err
+	}
 	c.mu.Unlock()
 	return clonePlan(completed), nil
 }
@@ -276,7 +329,7 @@ func (c *ReassignmentCoordinator) Abort(planID string) error {
 	plan.State = ReassignmentAborted
 	c.plans[planID] = plan
 	delete(c.active, plan.Key)
-	return nil
+	return c.persistLocked()
 }
 
 func (c *ReassignmentCoordinator) Plan(planID string) (ReassignmentPlan, error) {
@@ -300,9 +353,83 @@ func clonePlan(plan ReassignmentPlan) ReassignmentPlan {
 
 func cloneAssignment(assignment controller.PartitionAssignment) controller.PartitionAssignment {
 	assignment.Replicas = append([]string(nil), assignment.Replicas...)
+	assignment.ISR = append([]string(nil), assignment.ISR...)
 	return assignment
 }
 
 func sameAssignment(a, b controller.PartitionAssignment) bool {
-	return a.Key == b.Key && a.Leader == b.Leader && a.LeaderEpoch == b.LeaderEpoch && slices.Equal(a.Replicas, b.Replicas)
+	return a.Key == b.Key && a.Leader == b.Leader && a.LeaderEpoch == b.LeaderEpoch && slices.Equal(a.Replicas, b.Replicas) && slices.Equal(a.ISR, b.ISR)
+}
+
+type reassignmentStoreState struct {
+	Version  uint16                      `json:"version"`
+	NextPlan uint64                      `json:"next_plan"`
+	Plans    map[string]ReassignmentPlan `json:"plans"`
+}
+
+type reassignmentStore struct{ path string }
+
+func openReassignmentStore(directory string) (*reassignmentStore, reassignmentStoreState, error) {
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return nil, reassignmentStoreState{}, err
+	}
+	store := &reassignmentStore{path: filepath.Join(directory, "reassignments.json")}
+	data, err := os.ReadFile(store.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return store, reassignmentStoreState{Version: 1, Plans: make(map[string]ReassignmentPlan)}, nil
+	}
+	if err != nil {
+		return nil, reassignmentStoreState{}, err
+	}
+	var state reassignmentStoreState
+	if err := json.Unmarshal(data, &state); err != nil || state.Version != 1 || state.Plans == nil {
+		return nil, reassignmentStoreState{}, fmt.Errorf("decode reassignment state: %w", ErrInvalidConfig)
+	}
+	return store, state, nil
+}
+
+func (c *ReassignmentCoordinator) persistLocked() error {
+	if c.store == nil {
+		return nil
+	}
+	state := reassignmentStoreState{Version: 1, NextPlan: c.nextPlan, Plans: make(map[string]ReassignmentPlan, len(c.plans))}
+	for id, plan := range c.plans {
+		state.Plans[id] = clonePlan(plan)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(c.store.path), ".reassignments-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	cleanup := func() { _ = temp.Close(); _ = os.Remove(tempPath) }
+	if err := temp.Chmod(0600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	if err := os.Rename(tempPath, c.store.path); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(c.store.path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
