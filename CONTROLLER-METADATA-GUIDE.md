@@ -48,11 +48,11 @@ The script starts three independent broker executables and data directories, wai
 
 - The voter set is fixed for the lifetime of the persisted controller state. Voter reconfiguration is not implemented.
 - Startup reconciliation creates missing initial assignments, but it never silently overwrites an existing committed assignment.
-- Controller leadership and partition leadership are separate. This milestone commits the initial partition leader and replica set; automatic promotion after partition-leader failure is not implemented yet.
+- Controller leadership and partition leadership are separate. The elected controller now detects an unreachable partition leader, verifies eligible replicas' commit state, and commits an in-set replacement with a higher leader epoch. See `PARTITION-LEADER-FAILOVER-GUIDE.md`.
 - There is no staged reassignment/catch-up workflow attached to controller metadata commands yet.
 - The Raft transport currently uses full-log AppendEntries for the small fixed cluster. Per-peer next/match indexes, backtracking, snapshots, and large-log compaction remain future work.
 - Peer RPC and the HTTP admin endpoints are plaintext/unauthenticated; keep them on a trusted private network.
 - Each broker must retain its own `DATA_DIR`. Do not share one broker's local directory between processes.
 - Set `MESSLESSMQ_MIN_ISR=2` for the three-broker examples if `acks=all` must require at least two in-sync replicas.
 
-The controller metadata smoke test proves committed initial assignment and data replication across processes. It does not prove automatic partition-leader failover or production-grade Raft membership changes.
+The controller metadata smoke test proves committed initial assignment and data replication across processes. `scripts/partition-leader-failover-smoke.sh` separately proves process-level partition leader failure, safe committed promotion, keyed client metadata refresh, old leader restart, and catch-up. Neither smoke test proves production-grade dynamic voter reconfiguration or dynamic replica reassignment.

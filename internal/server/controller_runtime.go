@@ -35,25 +35,28 @@ type controllerRuntime struct {
 	heartbeat   time.Duration
 	rpcTimeout  time.Duration
 
-	requestID  atomic.Uint64
-	contact    chan struct{}
-	proposalMu sync.Mutex
-	onCommit   func()
+	requestID         atomic.Uint64
+	contact           chan struct{}
+	lastLeaderContact atomic.Int64
+	lastQuorumContact atomic.Int64
+	proposalMu        sync.Mutex
+	onCommit          func()
 }
 
 type ControllerRuntimeStatus struct {
-	BrokerID     string   `json:"broker_id"`
-	Role         string   `json:"role"`
-	Term         uint64   `json:"term"`
-	VotedFor     string   `json:"voted_for,omitempty"`
-	LeaderID     string   `json:"leader_id,omitempty"`
-	LastLogIndex uint64   `json:"last_log_index"`
-	CommitIndex  uint64   `json:"commit_index"`
-	AppliedIndex uint64   `json:"applied_index"`
-	Voters       []string `json:"voters"`
-	KnownVoters  int      `json:"known_voters"`
-	VoterCount   int      `json:"voter_count"`
-	Ready        bool     `json:"ready"`
+	BrokerID       string   `json:"broker_id"`
+	Role           string   `json:"role"`
+	Term           uint64   `json:"term"`
+	VotedFor       string   `json:"voted_for,omitempty"`
+	LeaderID       string   `json:"leader_id,omitempty"`
+	LastLogIndex   uint64   `json:"last_log_index"`
+	CommitIndex    uint64   `json:"commit_index"`
+	AppliedIndex   uint64   `json:"applied_index"`
+	Voters         []string `json:"voters"`
+	KnownVoters    int      `json:"known_voters"`
+	VoterCount     int      `json:"voter_count"`
+	Ready          bool     `json:"ready"`
+	AuthorityValid bool     `json:"authority_valid"`
 }
 
 func newControllerRuntime(brokerID string, voters []string, node *controller.DurableNode, members *membership.Registry, cfg config.Config, logger *slog.Logger) (*controllerRuntime, error) {
@@ -85,9 +88,40 @@ func (r *controllerRuntime) NotifyLeaderContact() {
 	if r == nil {
 		return
 	}
+	r.lastLeaderContact.Store(time.Now().UnixNano())
 	select {
 	case r.contact <- struct{}{}:
 	default:
+	}
+}
+
+// HasAuthority reports whether this broker has a recent controller lease.
+// A controller leader renews the lease only after a majority acknowledges its
+// heartbeat; followers renew it only after accepting the current leader's
+// AppendEntries. The short lease makes isolated stale brokers fail closed
+// before a replacement controller can promote a new partition leader.
+func (r *controllerRuntime) HasAuthority() bool {
+	if r == nil || r.node == nil {
+		return false
+	}
+	status := r.node.Status()
+	lease := 2 * r.heartbeat
+	if lease <= 0 {
+		lease = 300 * time.Millisecond
+	}
+	now := time.Now()
+	switch status.Role {
+	case controller.RoleLeader:
+		last := r.lastQuorumContact.Load()
+		return last > 0 && now.Sub(time.Unix(0, last)) <= lease
+	case controller.RoleFollower:
+		if status.LeaderID == "" {
+			return false
+		}
+		last := r.lastLeaderContact.Load()
+		return last > 0 && now.Sub(time.Unix(0, last)) <= lease
+	default:
+		return false
 	}
 }
 
@@ -107,7 +141,7 @@ func (r *controllerRuntime) Status() ControllerRuntimeStatus {
 		VotedFor: status.VotedFor, LeaderID: status.LeaderID,
 		LastLogIndex: status.LastLogIndex, CommitIndex: status.CommitIndex,
 		AppliedIndex: status.AppliedIndex, Voters: append([]string(nil), r.voters...),
-		KnownVoters: known, VoterCount: len(r.voters), Ready: known == len(r.voters),
+		KnownVoters: known, VoterCount: len(r.voters), Ready: known == len(r.voters), AuthorityValid: r.HasAuthority(),
 	}
 }
 
@@ -268,6 +302,11 @@ func (r *controllerRuntime) Propose(parent context.Context, command controller.C
 		go func() {
 			var response controller.AppendEntriesResponse
 			err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response)
+			if err == nil && response.Term > request.Term {
+				if persistErr := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); persistErr != nil {
+					r.logger.Error("persist higher controller term from heartbeat", "peer_id", peerID, "error", persistErr)
+				}
+			}
 			results <- result{peerID: peerID, response: response, err: err}
 		}()
 	}
@@ -314,24 +353,52 @@ func (r *controllerRuntime) Propose(parent context.Context, command controller.C
 }
 
 func (r *controllerRuntime) sendHeartbeats(parent context.Context) {
-	if r.node.Status().Role != controller.RoleLeader {
+	status := r.node.Status()
+	if status.Role != controller.RoleLeader {
 		return
 	}
 	request := r.node.AppendRequest()
 	peers := r.peerIDs()
+	type result struct {
+		peerID   string
+		response controller.AppendEntriesResponse
+		err      error
+	}
+	results := make(chan result, len(peers))
 	for _, peerID := range peers {
 		peerID := peerID
 		go func() {
 			var response controller.AppendEntriesResponse
-			if err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response); err != nil {
-				return
-			}
-			if response.Term > request.Term {
-				if err := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); err != nil {
-					r.logger.Error("persist higher controller term", "peer_id", peerID, "error", err)
+			err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response)
+			if err == nil && response.Term > request.Term {
+				if persistErr := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); persistErr != nil {
+					r.logger.Error("persist higher controller term from heartbeat", "peer_id", peerID, "error", persistErr)
 				}
 			}
+			results <- result{peerID: peerID, response: response, err: err}
 		}()
+	}
+	acknowledgements := 1 // this node's durable state
+	if acknowledgements >= r.majority() {
+		r.lastQuorumContact.Store(time.Now().UnixNano())
+		return
+	}
+	for received := 0; received < len(peers); received++ {
+		select {
+		case <-parent.Done():
+			return
+		case result := <-results:
+			if result.err == nil && result.response.Term == request.Term && result.response.Success {
+				acknowledgements++
+			}
+			if acknowledgements >= r.majority() {
+				current := r.node.Status()
+				if current.Role == controller.RoleLeader && current.Term == request.Term {
+					r.lastQuorumContact.Store(time.Now().UnixNano())
+				}
+				return
+			}
+		}
 	}
 }
 

@@ -64,7 +64,7 @@ The script requires `go`, `curl`, `nc`, and `python3`. It uses client ports `293
 - The runtime now proposes broker registrations and initial partition assignments through the durable controller log. A majority must store a proposal before the leader commits it; followers apply the committed prefix. See `CONTROLLER-METADATA-GUIDE.md`.
 - Controller-committed assignments drive the initial METADATA response and data replication routing. If no explicit `MESSLESSMQ_REPLICA_ASSIGNMENTS` map is configured, every fixed voter is assigned as a replica and the initial leader rotates by partition ID over sorted voter IDs.
 - The controller leader is not necessarily the leader of any message partition. They are different roles.
-- The election smoke test kills a controller process. It does not prove data-partition leader failover or continued writes through a promoted replica.
+- The election smoke test kills a controller process. Data-partition leader failover is a separate controller-driven workflow covered by `scripts/partition-leader-failover-smoke.sh` and `PARTITION-LEADER-FAILOVER-GUIDE.md`.
 - The fixed voter set is not dynamically reconfigured. The current peer RPCs are plaintext/unauthenticated, and the Raft transport has not yet implemented per-peer progress/backtracking or snapshot transfer.
 
-The next milestone is to connect committed controller assignment changes to safe partition leader promotion, replica catch-up/reassignment, and client metadata refresh/routing.
+The next hardening work is dynamic ISR/reassignment, replica snapshot/rebootstrap, authenticated peer RPCs, and deeper network/disk chaos testing. Partition leader promotion and keyed CLI metadata routing are now integrated; see `PARTITION-LEADER-FAILOVER-GUIDE.md`.

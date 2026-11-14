@@ -101,6 +101,9 @@ func (s *Server) runControllerMetadata(ctx context.Context) {
 			if err := s.reconcileControllerMetadata(ctx); err != nil && !errors.Is(err, controller.ErrNotLeader) && !errors.Is(err, controller.ErrNoQuorum) && !errors.Is(err, context.Canceled) {
 				s.logger.Warn("controller metadata reconciliation deferred", "error", err)
 			}
+			if err := s.reconcilePartitionLeaders(ctx); err != nil && !errors.Is(err, controller.ErrNotLeader) && !errors.Is(err, controller.ErrNoQuorum) && !errors.Is(err, context.Canceled) {
+				s.logger.Warn("partition leader reconciliation deferred", "error", err)
+			}
 		}
 	}
 }

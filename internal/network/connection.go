@@ -111,6 +111,9 @@ func errorCodeFromError(err error) uint16 {
 	if errors.Is(err, protocol.ErrClusterMetadataUnavailable) {
 		return protocol.ErrorClusterMetadataUnavailable
 	}
+	if errors.Is(err, protocol.ErrControllerAuthorityUnavailable) {
+		return protocol.ErrorControllerAuthorityUnavailable
+	}
 	if errors.Is(err, topic.ErrTopicNotFound) {
 		return protocol.ErrorUnknownTopic
 	}

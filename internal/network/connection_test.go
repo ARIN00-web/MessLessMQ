@@ -28,6 +28,7 @@ func TestErrorCodeFromError(t *testing.T) {
 		{name: "insufficient ISR", err: protocol.ErrInsufficientISR, want: protocol.ErrorInsufficientISR},
 		{name: "uncertain commit", err: protocol.ErrCommitUncertain, want: protocol.ErrorCommitUncertain},
 		{name: "committed metadata unavailable", err: protocol.ErrClusterMetadataUnavailable, want: protocol.ErrorClusterMetadataUnavailable},
+		{name: "controller authority unavailable", err: protocol.ErrControllerAuthorityUnavailable, want: protocol.ErrorControllerAuthorityUnavailable},
 		{name: "internal error", err: errors.New("something went wrong"), want: protocol.ErrorInternal},
 	}
 	for _, tt := range tests {

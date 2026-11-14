@@ -65,7 +65,9 @@ type Server struct {
 	health             *observability.HealthChecker
 	diagnostics        *observability.Diagnostics
 
-	serveOnce sync.Once
+	failoverMu        sync.Mutex
+	partitionFailures map[partitionKey]partitionFailureState
+	serveOnce         sync.Once
 }
 
 func New(options Options) (*Server, error) {
@@ -226,7 +228,11 @@ func New(options Options) (*Server, error) {
 		// command has been committed and applied by this broker's Raft node.
 		assignmentStore.replace(nil)
 	}
-	distributed := newDistributedAppender(cfg.BrokerID, members, assignmentStore, controllerEnabled, cfg.MinISR, commits)
+	var hasControllerAuthority func() bool
+	if controllerRuntimeInstance != nil {
+		hasControllerAuthority = controllerRuntimeInstance.HasAuthority
+	}
+	distributed := newDistributedAppender(cfg.BrokerID, members, assignmentStore, controllerEnabled, cfg.MinISR, commits, hasControllerAuthority)
 	dispatcher.SetPartitionAppendFunc(distributed.Append)
 	dispatcher.SetHighWatermarkLookup(func(topicName string, partitionID uint32) (uint64, error) {
 		state, exists := commits.Get(topicName, partitionID)
@@ -353,7 +359,7 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 		}
 	}
 	if len(s.desiredAssignments) > 0 {
-		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignmentStore, s.commits)
+		replicationHandler, handlerErr := newReplicationPeerHandler(s.cfg.BrokerID, s.members, s.registry, s.assignmentStore, s.commits, s.controllerNode)
 		if handlerErr != nil {
 			_ = listener.Close()
 			return nil, handlerErr
@@ -369,6 +375,12 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 		if err := mux.Register(interbroker.MessageReplicationCommit, replicationHandler); err != nil {
 			_ = listener.Close()
 			return nil, err
+		}
+		if s.controllerNode != nil {
+			if err := mux.Register(interbroker.MessagePartitionStatus, replicationHandler); err != nil {
+				_ = listener.Close()
+				return nil, err
+			}
 		}
 	}
 	peerServer, err := interbroker.NewServer(mux)

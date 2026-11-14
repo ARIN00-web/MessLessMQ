@@ -2,7 +2,7 @@
 
 MessLessMQ is a from-scratch Go message broker project. Each broker process provides a persistent TCP data path with durable topics/partitions, PRODUCE, CONSUME, and METADATA APIs, a small CLI, optional TLS/mTLS, metrics, health endpoints, request limits, and graceful shutdown. An optional peer listener supports seed-based broker membership discovery and a fixed-voter, durable Raft controller election across independent processes.
 
-The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership, synchronous remote record replication, durable commit markers, fixed-voter controller elections, and Raft-committed broker/partition metadata are wired across independent processes. Each broker applies only committed controller assignments to its live metadata and replication routing view. Partition leaders are still fixed by the committed initial assignment: automatic data-partition leader promotion, dynamic ISR changes, staged reassignment, and client rerouting remain future work.
+The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership, synchronous remote record replication, durable commit markers, fixed-voter controller elections, and Raft-committed broker/partition metadata are wired across independent processes. Each broker applies only committed controller assignments to its live metadata and replication routing view. The elected controller can promote an eligible in-set partition replica under a higher leader epoch after repeated leader-probe failures; keyed CLI produce refreshes metadata and routes to the new leader. Dynamic ISR changes, staged reassignment, and safe rebootstrap of divergent replicas remain future work.
 
 See [docs/architecture-review.md](docs/architecture-review.md) for the implemented boundary and remaining distributed-runtime work.
 
@@ -40,7 +40,7 @@ go run ./cmd/client produce -addr 127.0.0.1:9092 -topic orders -key customer-7 -
 go run ./cmd/client consume -addr 127.0.0.1:9092 -topic orders -partition 0 -offset 0 -max 10
 ```
 
-The producer routes keyed messages deterministically to a partition. With one partition, every message routes to partition zero. For multiple partitions, inspect the metadata/produce response to determine the selected partition before consuming.
+The CLI producer automatically fetches METADATA and routes keyed messages to the committed partition leader. It mirrors the broker's FNV-1a key partitioner and refreshes metadata once after a stale-leader/authority response. Unkeyed produce is not automatically routed because its partition selection is broker-local round robin. With one partition, every message routes to partition zero.
 
 ## API versions
 
@@ -150,9 +150,9 @@ After all configured voters are visible through membership, the elected controll
 
 Controller term, vote, log, and commit index persist under `<DATA_DIR>/metadata/controller/raft-state.json`. A restarted voter comes back as a follower. Data replication uses independent per-broker commit stores under `<DATA_DIR>/metadata/commits/`; consumers hide offsets at or beyond their local exclusive high watermark.
 
-The controller currently commits initial broker registration and partition assignment metadata for a fixed voter set. Existing committed assignments are authoritative and startup reconciliation will not overwrite them. Partition leadership is still fixed by the committed initial assignment: automatic partition leader promotion, dynamic ISR removal, staged replica reassignment, and client-side automatic rerouting are not implemented yet. The current peer protocol is plaintext and unauthenticated; keep peer and admin listeners on trusted private networks.
+The controller commits broker registration and partition assignment metadata for a fixed voter set. Existing committed assignments are authoritative and startup reconciliation will not overwrite them. When the current partition leader becomes unreachable, the elected controller probes it repeatedly, verifies the other assigned replicas' durable commit state, and commits a new leader with an incremented epoch only if a replica's log ends exactly at the highest observed high watermark. The old leader's controller-authority lease fences it from further writes after lease expiry. Keyed CLI produce refreshes METADATA and routes to the new leader. Dynamic ISR removal, staged replica reassignment, and automatic routing for unkeyed produce/consumer fetch are not implemented. The current peer protocol is plaintext and unauthenticated; keep peer and admin listeners on trusted private networks.
 
-`scripts/controller-metadata-smoke.sh` starts three independent broker processes, verifies the committed broker and partition metadata on all voters, checks the normal METADATA API, and produces/consumes a record from both follower logs. `scripts/replication-smoke.sh` verifies durable record replication, commit markers, committed-read filtering, and MinISR behavior. `scripts/controller-election-smoke.sh` verifies controller-leader replacement after process failure and old-voter rejoin. See [CONTROLLER-ELECTION-GUIDE.md](CONTROLLER-ELECTION-GUIDE.md) and [CONTROLLER-METADATA-GUIDE.md](CONTROLLER-METADATA-GUIDE.md).
+`scripts/controller-metadata-smoke.sh` starts three independent broker processes, verifies committed broker and partition metadata, checks the normal METADATA API, and produces/consumes a record from both follower logs. `scripts/replication-smoke.sh` verifies durable record replication, commit markers, committed-read filtering, and MinISR behavior. `scripts/controller-election-smoke.sh` verifies controller-leader replacement after process failure and old-voter rejoin. `scripts/partition-leader-failover-smoke.sh` kills a partition leader, verifies safe controller-committed promotion, routes keyed production to the new leader, restarts the old broker, and verifies replica catch-up. See [CONTROLLER-ELECTION-GUIDE.md](CONTROLLER-ELECTION-GUIDE.md), [CONTROLLER-METADATA-GUIDE.md](CONTROLLER-METADATA-GUIDE.md), and [PARTITION-LEADER-FAILOVER-GUIDE.md](PARTITION-LEADER-FAILOVER-GUIDE.md).
 
 ## Tests and validation
 
@@ -194,6 +194,10 @@ go vet ./...
 
 ```bash
 ./scripts/controller-metadata-smoke.sh
+```
+
+```bash
+./scripts/partition-leader-failover-smoke.sh
 ```
 
 `scripts/crash-restart.sh` requires `nc` and port `19092` to be free. It produces a synchronously acknowledged record, sends SIGKILL to the broker, restarts it on the same temporary data directory, and verifies the record is still readable. This tests local log durability/recovery, not replication.
@@ -238,7 +242,7 @@ The StatefulSet requests one 5Gi persistent volume claim per pod; the cluster mu
 - Consumer group coordination and durable offset APIs exist as packages but are not exposed end-to-end through the public request protocol.
 - Broker registrations and initial partition assignments are proposed, majority-committed, and applied from the fixed-voter controller log.
 - Remote record replication and durable commit markers use the committed assignment view when controller mode is enabled.
-- Partition leader promotion, dynamic ISR changes, staged replica reassignment, and automatic client rerouting are not yet implemented.
+- Controller-driven partition leader promotion for the existing static replica set is implemented; dynamic ISR changes and staged replica reassignment are not. The keyed CLI producer auto-routes and refreshes once; unkeyed produce and consumer fetch routing are not automatic.
 - Peer RPCs are plaintext and unauthenticated; admin endpoints are unauthenticated and must remain private. Consumer-group membership and offset commit/fetch are not yet exposed as a complete wire protocol.
 
-Do not describe the current build as a production-ready replicated Kafka replacement. It is a functioning persistent broker cluster with fixed-voter controller elections, committed initial broker/partition metadata, and synchronous inter-process replication. It still needs safe controller-driven partition failover, secure peer RPCs, dynamic reassignment, and end-to-end client routing.
+Do not describe the current build as a production-ready replicated Kafka replacement. It is a functioning persistent broker cluster with fixed-voter controller elections, committed broker/partition metadata, synchronous inter-process replication, committed-read boundaries, and automatic in-set partition leader failover with keyed CLI routing. It still needs secure peer RPCs, dynamic reassignment/ISR, a divergent-replica rebootstrap path, broader client routing, and deeper chaos testing.

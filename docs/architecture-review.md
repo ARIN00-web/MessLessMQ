@@ -36,11 +36,15 @@ A failed data quorum can leave uncommitted physical log tails. They are hidden f
 
 The running broker can participate in a fixed-voter Raft controller election over the peer TCP transport. The voter list is explicit and identical across members. Elections use randomized timeouts and majority voting; leaders send AppendEntries heartbeats. Each controller persists term, vote, log, and commit index. On restart, role and leader identity are discarded and the voter rejoins as a follower. A three-process smoke test kills the elected controller leader, observes a replacement leader, restarts the old process from its original data directory, and verifies that it rejoins as a follower.
 
-The runtime now has a fixed-voter controller proposal path for broker registration and initial partition assignment. Proposals are replicated to a majority, committed under the current-term rule, and applied from the committed snapshot on each broker. `GET /controller/metadata` exposes the committed snapshot; the ordinary METADATA API and replication adapter use the applied assignment view. The controller leader is distinct from a partition leader. Controller election still does not promote a new data-partition leader when the statically assigned partition leader dies.
+The runtime now has a fixed-voter controller proposal path for broker registration and initial partition assignment. Proposals are replicated to a majority, committed under the current-term rule, and applied from the committed snapshot on each broker. `GET /controller/metadata` exposes the committed snapshot; the ordinary METADATA API and replication adapter use the applied assignment view. The controller leader is distinct from a partition leader.
+
+The current runtime also performs controller-driven partition leader promotion. The elected controller probes the assigned partition leader three times (350 ms per probe) before attempting failover. It queries the other assigned replicas and only considers a replica whose commit-store leader ID and epoch match the old assignment, whose high watermark is the highest observed among eligible replicas, and whose physical log end is exactly that high watermark. A replica with an uncommitted physical suffix is not eligible. The controller commits the new leader with an incremented leader epoch; brokers apply the committed assignment and update their local commit state. A failed or partitioned old leader is fenced from data writes when its controller-authority lease expires. The controller lease is renewed by a majority heartbeat for a leader or accepted AppendEntries from the current leader for a follower.
+
+The keyed CLI producer now fetches METADATA, mirrors the broker's FNV-1a key partitioner, connects to the advertised partition leader, and refreshes metadata once after a not-leader or controller-authority error. Unkeyed CLI produce is not automatically routed because the broker's round-robin choice cannot be inferred from a message key. The CLI consumer remains an explicit broker/partition/offset fetch. The three-process partition failover smoke test kills a partition leader, verifies a committed replacement leader and epoch, produces through refreshed client metadata, restarts the former leader, and verifies it catches up from the new leader's log.
 
 ### Client and consumer APIs
 
-The client router remains a package-level metadata cache; the CLI connects to the broker address supplied by the user and does not automatically route to partition leaders. Consumer group membership, group coordination, and committed consumer-offset APIs are not exposed end-to-end through the public TCP protocol. The CLI consume operation is an explicit stateless partition/offset fetch.
+The CLI keyed producer fetches METADATA, mirrors the broker's FNV-1a partition selection, routes to the committed partition leader's advertised address, and refreshes metadata/retries once after a stale-leader or authority error. Unkeyed produce is not auto-routed because partition selection is broker-local round robin. The CLI consume operation remains an explicit stateless broker/partition/offset fetch. Consumer group membership, group coordination, and committed consumer-offset APIs are not exposed end-to-end through the public TCP protocol.
 
 ## 3. Storage and message format
 
@@ -68,7 +72,7 @@ A produce batch is not transactional. A disk error partway through a multi-recor
 - Default deployment manifests configure a fixed three-voter controller and `MESSLESSMQ_MIN_ISR=2`. When no explicit replica map is supplied, the elected controller commits a deterministic assignment containing all fixed voters for every bootstrap partition, with the initial leader rotated by partition ID.
 - Kubernetes TCP probes only show that the process accepts a connection; they do not establish data replication health, commit convergence, or controller quorum readiness.
 
-Persistent volumes protect each broker's local state where the storage provider honors the PVC. Controller-committed replica assignments enable synchronous record and commit-marker replication. The controller commits initial broker registrations and partition assignments. It cannot yet perform a staged replica reassignment or automatically promote a replacement partition leader.
+Persistent volumes protect each broker's local state where the storage provider honors the PVC. Controller-committed replica assignments enable synchronous record and commit-marker replication. The controller commits broker registrations and partition assignments, and can promote a safe in-set partition replica after leader failure. These manifests still represent a fixed voter set and do not provide staged replica reassignment or dynamic ISR membership.
 
 ## 6. Strong engineering aspects
 
@@ -83,15 +87,13 @@ Persistent volumes protect each broker's local state where the storage provider 
 ## 7. Remaining work before a distributed production release
 
 1. Add authentication and TLS to inter-broker traffic, plus heartbeat/lease membership health and removal.
-2. Extend controller metadata commands with staged replica reassignment, partition leader promotion, and removal/fencing of unavailable replicas.
-3. Connect committed leader-epoch changes to replica catch-up verification, partition runtime leadership, and safe old-leader fencing.
-4. Improve Raft with per-peer replication progress/backtracking, follower snapshot/bootstrap, quorum-loss recovery, and safe voter reconfiguration.
-5. Route produce/fetch clients automatically using refreshed committed metadata and test leader changes end to end.
-7. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
-8. Integrate API-key authentication and ACL authorization into the TCP request pipeline and provide a TLS-capable client.
-9. Define idempotency/retry semantics across partial appends, uncertain commit outcomes, and server restarts.
-10. Add multi-process data-plane failover tests: kill a partition leader, continue writes/reads through a promoted replica, restart the former leader, and verify catch-up.
-11. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
+2. Add dynamic ISR membership, staged replica reassignment, and a safe snapshot/rebootstrap path for replicas with divergent uncommitted suffixes.
+3. Improve Raft with per-peer replication progress/backtracking, follower snapshot/bootstrap, stronger quorum-loss recovery, and safe voter reconfiguration.
+4. Extend client routing to unkeyed produce, consumer fetch, and a reusable client metadata cache; define bounded retry and uncertain-outcome behavior.
+5. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.
+6. Integrate API-key authentication and ACL authorization into the TCP request pipeline, and authenticate/encrypt peer RPCs with TLS/mTLS.
+7. Define idempotency/retry semantics across partial appends, uncertain commit outcomes, and server restarts.
+8. Measure end-to-end throughput, p95/p99 latency, replication lag, recovery time, and durability under process, network, and disk faults.
 
 ## 8. Delivery-semantics caution
 
@@ -99,4 +101,4 @@ The codebase contains at-most-once, at-least-once, idempotent-producer, duplicat
 
 ## 9. Final assessment
 
-MessLessMQ has a persistent broker runtime, real inter-process synchronous record replication with durable commit markers, fixed-voter controller elections with durable term/vote/log/commit state, and controller-committed broker registrations and initial partition assignments applied by each broker. It is not yet an autonomous fault-tolerant data cluster: partition leadership is not automatically promoted after failure, replica reassignment and dynamic ISR changes are not implemented, and clients do not automatically reroute after a leader change. It should not be presented as a production-ready Kafka replacement until those integration and security gaps are closed and tested end to end.
+MessLessMQ has a persistent broker runtime, real inter-process synchronous record replication with durable commit markers, fixed-voter controller elections with durable term/vote/log/commit state, controller-committed broker registrations and partition assignments, automatic in-set partition leader promotion, authority-lease fencing, and keyed CLI metadata refresh/routing. Three-process smoke tests exercise membership, replicated committed reads, controller leader failover, committed metadata, partition leader failover, and former-leader catch-up. It is a substantial distributed-systems implementation, but it is not yet a production-ready Kafka replacement: peer/admin traffic still needs authentication, dynamic ISR and staged reassignment are absent, divergent replicas require manual rebootstrap, client APIs are incomplete, and deeper Raft/network/disk chaos testing remains necessary.

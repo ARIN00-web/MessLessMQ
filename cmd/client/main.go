@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 
@@ -48,6 +51,14 @@ func parseFlags(name string, args []string, setup func(*flag.FlagSet) error) err
 	return fs.Parse(args)
 }
 
+type brokerResponseError struct {
+	Code uint16
+}
+
+func (e *brokerResponseError) Error() string {
+	return fmt.Sprintf("broker returned error code %d", e.Code)
+}
+
 func request(address string, api uint16, version uint16, payload []byte) (protocol.Response, error) {
 	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 	if err != nil {
@@ -71,19 +82,74 @@ func request(address string, api uint16, version uint16, payload []byte) (protoc
 		return protocol.Response{}, err
 	}
 	if response.ErrorCode != protocol.ErrorNone {
-		return response, fmt.Errorf("broker returned error code %d", response.ErrorCode)
+		return response, &brokerResponseError{Code: response.ErrorCode}
 	}
 	return response, nil
 }
 
+func fetchMetadata(address, topicName string) (protocol.MetadataResponse, error) {
+	payload, err := protocol.EncodeMetadataRequest(protocol.MetadataRequest{Topic: topicName})
+	if err != nil {
+		return protocol.MetadataResponse{}, err
+	}
+	response, err := request(address, protocol.APIMETADATA, protocol.MetadataAPIVersion, payload)
+	if err != nil {
+		return protocol.MetadataResponse{}, err
+	}
+	return protocol.DecodeMetadataResponse(response.Payload)
+}
+
+// routeProduceAddress mirrors the broker's FNV-1a key partitioner and resolves
+// the currently committed partition leader from a metadata snapshot.
+func partitionForKey(metadata protocol.MetadataResponse, topicName string, key []byte) (protocol.PartitionMetadata, error) {
+	if len(key) == 0 {
+		return protocol.PartitionMetadata{}, fmt.Errorf("automatic routing requires a non-empty message key")
+	}
+	partitions := make([]protocol.PartitionMetadata, 0)
+	for _, partition := range metadata.Partitions {
+		if partition.Topic == topicName {
+			partitions = append(partitions, partition)
+		}
+	}
+	if len(partitions) == 0 {
+		return protocol.PartitionMetadata{}, fmt.Errorf("metadata contains no partitions for topic %q", topicName)
+	}
+	sort.Slice(partitions, func(i, j int) bool { return partitions[i].PartitionID < partitions[j].PartitionID })
+	hash := fnv.New32a()
+	_, _ = hash.Write(key)
+	index := int(hash.Sum32() % uint32(len(partitions)))
+	return partitions[index], nil
+}
+
+// routeProduceAddress mirrors the broker's FNV-1a key partitioner and resolves
+// the currently committed partition leader from a metadata snapshot.
+func routeProduceAddress(bootstrapAddress, topicName string, key []byte) (string, uint32, error) {
+	metadata, err := fetchMetadata(bootstrapAddress, topicName)
+	if err != nil {
+		return "", 0, err
+	}
+	selected, err := partitionForKey(metadata, topicName, key)
+	if err != nil {
+		return "", 0, err
+	}
+	for _, broker := range metadata.Brokers {
+		if broker.ID == selected.Leader {
+			return broker.Address, selected.PartitionID, nil
+		}
+	}
+	return "", 0, fmt.Errorf("metadata has no address for partition leader %q", selected.Leader)
+}
+
 func runProduce(args []string) error {
 	var address, topicName, key, value, ackText string
+	var autoRoute bool
 	if err := parseFlags("produce", args, func(fs *flag.FlagSet) error {
 		fs.StringVar(&address, "addr", "127.0.0.1:9092", "broker address")
 		fs.StringVar(&topicName, "topic", "", "topic name")
 		fs.StringVar(&key, "key", "", "optional message key")
 		fs.StringVar(&value, "value", "", "message value")
 		fs.StringVar(&ackText, "acks", "leader", "acknowledgement mode: none, leader, all")
+		fs.BoolVar(&autoRoute, "auto-route", true, "route keyed messages using current cluster metadata")
 		return nil
 	}); err != nil {
 		return err
@@ -110,7 +176,29 @@ func runProduce(args []string) error {
 	if err != nil {
 		return err
 	}
-	response, err := request(address, protocol.APIPRODUCE, 1, payload)
+	targetAddress := address
+	routedPartition := uint32(0)
+	wasRouted := autoRoute && len(messageKey) > 0
+	if wasRouted {
+		targetAddress, routedPartition, err = routeProduceAddress(address, topicName, messageKey)
+		if err != nil {
+			return fmt.Errorf("resolve partition leader: %w", err)
+		}
+		fmt.Printf("routing topic=%s partition=%d leader_address=%s\n", topicName, routedPartition, targetAddress)
+	}
+	response, err := request(targetAddress, protocol.APIPRODUCE, 1, payload)
+	if err != nil && autoRoute && len(messageKey) > 0 {
+		var brokerErr *brokerResponseError
+		refresh := errors.As(err, &brokerErr) && (brokerErr.Code == protocol.ErrorNotPartitionLeader || brokerErr.Code == protocol.ErrorControllerAuthorityUnavailable)
+		if refresh {
+			var refreshedAddress string
+			refreshedAddress, _, refreshErr := routeProduceAddress(address, topicName, messageKey)
+			if refreshErr != nil {
+				return errors.Join(err, fmt.Errorf("refresh metadata: %w", refreshErr))
+			}
+			response, err = request(refreshedAddress, protocol.APIPRODUCE, 1, payload)
+		}
+	}
 	if err != nil {
 		return err
 	}

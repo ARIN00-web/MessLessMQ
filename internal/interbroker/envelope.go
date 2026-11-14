@@ -25,6 +25,7 @@ const (
 	MessageBrokerJoin
 	MessageReplicationStatus
 	MessageReplicationCommit
+	MessagePartitionStatus
 )
 
 var (

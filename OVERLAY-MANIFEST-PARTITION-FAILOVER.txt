@@ -1,0 +1,31 @@
+MessLessMQ Partition Leader Failover v1 overlay
+
+Added:
+  PARTITION-LEADER-FAILOVER-GUIDE.md
+  docs/adr/0012-partition-leader-failover-and-client-routing.md
+  internal/server/partition_failover.go
+  internal/server/partition_failover_test.go
+  internal/server/controller_runtime_lease_test.go
+  cmd/client/main_test.go
+  scripts/partition-leader-failover-smoke.sh
+
+Updated:
+  cmd/client/main.go
+  internal/interbroker/envelope.go
+  internal/network/connection.go
+  internal/network/connection_test.go
+  internal/protocol/errors.go
+  internal/protocol/response.go
+  internal/server/controller_metadata.go
+  internal/server/controller_runtime.go
+  internal/server/replication.go
+  internal/server/server.go
+  README.md
+  INTEGRATION-CHANGELOG.md
+  docs/architecture-review.md
+  docs/runtime-integration.md
+  docs/production-test-plan.md
+
+No files are deleted. go.mod, go.sum, and .git are not included. Keep the repository's Go 1.27.1 directive unchanged.
+
+Historical Go module directive preserved: go 1.27.1. The overlay intentionally excludes go.mod, go.sum, and .git.

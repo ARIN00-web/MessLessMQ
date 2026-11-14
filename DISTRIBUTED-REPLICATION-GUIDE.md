@@ -95,7 +95,7 @@ The script:
 ## Deliberate limitations
 
 - In controller mode, replica assignments are sourced from the controller-committed metadata snapshot. If no explicit map is provided, the runtime assigns all fixed voters as replicas and rotates the initial leader by partition ID. Explicit ordered maps remain supported and must be consistent on every voter.
-- The first replica in each assignment is a fixed leader with epoch 1. No automatic leader election or failover is wired to the data plane.
+- The first replica in each initial assignment is the bootstrap leader at epoch 1. The live controller can now promote a safe replica from that same committed replica set after repeated failed status probes, committing a higher leader epoch. Dynamic replica-set changes are not implemented.
 - The in-process `replication.Manager` is not instantiated across processes; the runtime uses a separate server-side synchronous transport adapter.
 - Commit state is persisted locally on each broker, but there is no controller-coordinated reconciliation or quorum recovery after leader process loss.
 - If the leader watermark is persisted but commit-marker quorum is not confirmed, error 15 reports an uncertain outcome. The watermark is not rolled back.
@@ -103,8 +103,8 @@ The script:
 - Follower catch-up requires the follower to retain the leader's start offset. Snapshot/bootstrap for followers behind retention is not implemented.
 - Catch-up checks the latest overlapping record, not a full-log digest.
 - Inter-broker messages are plaintext and unauthenticated. Use only a trusted private network until peer authentication and TLS are integrated.
-- Client-side automatic leader routing is not implemented. Use METADATA to discover the leader and send PRODUCE to that broker.
+- The CLI automatically routes keyed PRODUCE requests using METADATA and refreshes/retries once after explicit stale-leader or controller-authority errors. Unkeyed produce and consumer fetch routing remain manual.
 - A durable fixed-voter controller election runs across real broker processes; term, vote, log entries, and commit index are persisted per voter. The elected leader commits broker registrations and initial partition assignments, and each broker applies only the committed snapshot to METADATA and replication routing.
-- Controller election is separate from partition leader election. The partition leader remains statically configured and is not automatically promoted when it fails.
+- Controller election and partition leader promotion are separate operations. The controller leader now promotes an assigned replica only when its commit metadata matches the old leader/epoch and its physical log end exactly equals the highest observed high watermark.
 
-The next milestone is to connect controller-committed leader-epoch changes to safe partition leader promotion, replica catch-up/reassignment, and client metadata refresh/routing.
+See `PARTITION-LEADER-FAILOVER-GUIDE.md` for the controller-driven failover algorithm, authority-lease fencing, keyed CLI routing, and the three-process failover/catch-up test. Remaining replication work includes dynamic ISR, staged reassignment, and a safe snapshot/rebootstrap path for divergent replicas.
