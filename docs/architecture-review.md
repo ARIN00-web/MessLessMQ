@@ -87,7 +87,7 @@ Persistent volumes protect each broker's local state where the storage provider 
 ## 7. Remaining work before a distributed production release
 
 1. Add authentication and TLS to inter-broker traffic, plus heartbeat/lease membership health and removal.
-2. Add dynamic ISR membership, staged replica reassignment, and a safe snapshot/rebootstrap path for replicas with divergent uncommitted suffixes.
+2. Extend the conservative controller-committed ISR tracker with lag-duration configuration and metrics, then add staged replica reassignment and a safe snapshot/rebootstrap path for replicas with divergent uncommitted suffixes.
 3. Improve Raft with per-peer replication progress/backtracking, follower snapshot/bootstrap, stronger quorum-loss recovery, and safe voter reconfiguration.
 4. Extend client routing to unkeyed produce, consumer fetch, and a reusable client metadata cache; define bounded retry and uncertain-outcome behavior.
 5. Expose topic administration, group join/heartbeat/leave, offset commit/fetch, and group-aware consumption through versioned wire APIs.

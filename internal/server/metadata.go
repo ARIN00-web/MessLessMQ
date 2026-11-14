@@ -58,7 +58,13 @@ func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) 
 			committedAssignments[partitionKey{Topic: key.Topic, PartitionID: uint32(key.Partition)}] = partitionReplicaAssignment{
 				Topic: key.Topic, PartitionID: uint32(key.Partition),
 				Replicas: append([]string(nil), assignment.Replicas...),
+				ISR:      append([]string(nil), assignment.ISR...),
 				LeaderID: assignment.Leader, LeaderEpoch: assignment.LeaderEpoch,
+			}
+			if len(committedAssignments[partitionKey{Topic: key.Topic, PartitionID: uint32(key.Partition)}].ISR) == 0 {
+				assignment := committedAssignments[partitionKey{Topic: key.Topic, PartitionID: uint32(key.Partition)}]
+				assignment.ISR = append([]string(nil), assignment.Replicas...)
+				committedAssignments[partitionKey{Topic: key.Topic, PartitionID: uint32(key.Partition)}] = assignment
 			}
 		}
 	} else {
@@ -90,7 +96,7 @@ func (h *localMetadataHandler) Handle(request protocol.Request) ([]byte, error) 
 			key := partitionKey{Topic: topicName, PartitionID: partition.ID()}
 			assignment, assigned := committedAssignments[key]
 			if !assigned && h.controller == nil {
-				assignment = partitionReplicaAssignment{Topic: topicName, PartitionID: partition.ID(), Replicas: []string{h.brokerID}, LeaderID: h.brokerID, LeaderEpoch: 1}
+				assignment = partitionReplicaAssignment{Topic: topicName, PartitionID: partition.ID(), Replicas: []string{h.brokerID}, ISR: []string{h.brokerID}, LeaderID: h.brokerID, LeaderEpoch: 1}
 				assigned = true
 			}
 			if !assigned {

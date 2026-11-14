@@ -49,10 +49,14 @@ type PartitionKey struct {
 }
 
 type PartitionAssignment struct {
-	Key         PartitionKey `json:"key"`
-	Replicas    []string     `json:"replicas"`
-	Leader      string       `json:"leader"`
-	LeaderEpoch uint64       `json:"leader_epoch"`
+	Key      PartitionKey `json:"key"`
+	Replicas []string     `json:"replicas"`
+	// ISR is the controller-committed in-sync subset of Replicas.  It is kept
+	// separate from the replica assignment so a temporarily slow or failed
+	// replica does not change placement.
+	ISR         []string `json:"isr,omitempty"`
+	Leader      string   `json:"leader"`
+	LeaderEpoch uint64   `json:"leader_epoch"`
 }
 
 type CommandType uint8
@@ -60,6 +64,7 @@ type CommandType uint8
 const (
 	CommandRegisterBroker CommandType = iota + 1
 	CommandAssignPartition
+	CommandUpdatePartitionISR
 	CommandNoop
 )
 

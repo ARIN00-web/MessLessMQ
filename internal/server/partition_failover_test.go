@@ -39,6 +39,17 @@ func TestChoosePromotionCandidateRejectsUncommittedSuffix(t *testing.T) {
 	}
 }
 
+func TestEligiblePromotionISROmitsUnverifiedReplica(t *testing.T) {
+	assignment := controller.PartitionAssignment{Replicas: []string{"broker-1", "broker-2", "broker-3"}, Leader: "broker-1", LeaderEpoch: 2}
+	isr := eligiblePromotionISR(assignment, []replicaObservation{
+		{BrokerID: "broker-2", Status: replicationStatusResponse{BrokerID: "broker-2", StartOffset: 0, NextOffset: 5, HighWatermark: 5, CommitLeaderID: "broker-1", LeaderEpoch: 2}},
+		{BrokerID: "broker-3", Status: replicationStatusResponse{BrokerID: "broker-3", StartOffset: 0, NextOffset: 6, HighWatermark: 5, CommitLeaderID: "broker-1", LeaderEpoch: 2}},
+	}, 5)
+	if len(isr) != 1 || isr[0] != "broker-2" {
+		t.Fatalf("promotion ISR = %v, want [broker-2]", isr)
+	}
+}
+
 func TestChoosePromotionCandidateRejectsStaleEpochAndNonReplica(t *testing.T) {
 	assignment := controller.PartitionAssignment{
 		Key:      controller.PartitionKey{Topic: "orders", Partition: 0},

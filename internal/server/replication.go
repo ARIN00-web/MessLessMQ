@@ -34,6 +34,7 @@ type partitionReplicaAssignment struct {
 	Topic       string
 	PartitionID uint32
 	Replicas    []string
+	ISR         []string
 	LeaderID    string
 	LeaderEpoch uint64
 }
@@ -92,7 +93,7 @@ func parseReplicaAssignments(raw string) (map[partitionKey]partitionReplicaAssig
 		}
 		assignments[key] = partitionReplicaAssignment{
 			Topic: key.Topic, PartitionID: key.PartitionID,
-			Replicas: replicas, LeaderID: replicas[0], LeaderEpoch: 1,
+			Replicas: replicas, ISR: append([]string(nil), replicas...), LeaderID: replicas[0], LeaderEpoch: 1,
 		}
 	}
 	return assignments, nil
@@ -219,7 +220,7 @@ func (a *distributedAppender) appendAndReplicate(partition *topic.Partition, ass
 	}
 	acknowledgedFollowers := make([]string, 0, len(assignment.Replicas)-1)
 	var replicaErrors []error
-	for _, followerID := range assignment.Replicas {
+	for _, followerID := range assignment.ISR {
 		if followerID == a.brokerID {
 			continue
 		}

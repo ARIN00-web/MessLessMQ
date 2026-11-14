@@ -156,6 +156,7 @@ func (m *Manager) PlacePartition(topic string, partition int, replicationFactor 
 	assignment := controller.PartitionAssignment{
 		Key:         key,
 		Replicas:    replicas,
+		ISR:         append([]string(nil), replicas...),
 		Leader:      replicas[0],
 		LeaderEpoch: 1,
 	}
@@ -223,6 +224,7 @@ func (m *Manager) Metadata(controllerID string) (controller.MetadataSnapshot, er
 
 func cloneAssignment(assignment controller.PartitionAssignment) controller.PartitionAssignment {
 	assignment.Replicas = append([]string(nil), assignment.Replicas...)
+	assignment.ISR = append([]string(nil), assignment.ISR...)
 	return assignment
 }
 

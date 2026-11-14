@@ -67,6 +67,8 @@ type Server struct {
 
 	failoverMu        sync.Mutex
 	partitionFailures map[partitionKey]partitionFailureState
+	isrMu             sync.Mutex
+	replicaHealth     map[replicaHealthKey]replicaHealthState
 	serveOnce         sync.Once
 }
 
@@ -267,7 +269,8 @@ func New(options Options) (*Server, error) {
 		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
 		assignmentStore: assignmentStore, desiredAssignments: assignments, replicator: distributed, commits: commits,
 		controllerNode: durableController, controllerRuntime: controllerRuntimeInstance, health: health,
-		diagnostics: observability.NewDiagnostics(),
+		diagnostics:   observability.NewDiagnostics(),
+		replicaHealth: make(map[replicaHealthKey]replicaHealthState),
 	}
 	if server.controllerRuntime != nil {
 		server.controllerRuntime.onCommit = server.applyCommittedControllerMetadata

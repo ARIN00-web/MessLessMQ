@@ -79,7 +79,7 @@ func (s *Server) reconcilePartitionLeaders(parent context.Context) error {
 		if s.controllerNode.Status().Role != controller.RoleLeader {
 			return controller.ErrNotLeader
 		}
-		candidate, highWatermark, err := s.selectPromotionCandidate(parent, key, assignment)
+		candidate, highWatermark, promotionISR, err := s.selectPromotionCandidate(parent, key, assignment)
 		if err != nil {
 			failures = append(failures, fmt.Errorf("select replacement for %s:%d after leader %s became unreachable: %w", key.Topic, key.PartitionID, assignment.Leader, err))
 			continue
@@ -94,6 +94,9 @@ func (s *Server) reconcilePartitionLeaders(parent context.Context) error {
 		}
 		command := controller.Command{Type: controller.CommandAssignPartition, Assignment: controller.PartitionAssignment{
 			Key: current.Key, Replicas: append([]string(nil), current.Replicas...),
+			// Carry forward only replicas observed safe during this promotion.
+			// Never inherit the previous ISR blindly across a leader epoch.
+			ISR:    promotionISR,
 			Leader: candidate, LeaderEpoch: current.LeaderEpoch + 1,
 		}}
 		proposeCtx, proposeCancel := context.WithTimeout(parent, 5*time.Second)
@@ -179,6 +182,26 @@ func choosePromotionCandidate(assignment controller.PartitionAssignment, observe
 	return candidates[0], highestCommitted, nil
 }
 
+func eligiblePromotionISR(assignment controller.PartitionAssignment, observed []replicaObservation, highWatermark uint64) []string {
+	valid := make(map[string]struct{}, len(observed))
+	for _, replica := range observed {
+		status := replica.Status
+		if replica.BrokerID == "" || !containsControllerReplica(assignment.Replicas, replica.BrokerID) ||
+			status.BrokerID != replica.BrokerID || status.CommitLeaderID != assignment.Leader || status.LeaderEpoch != assignment.LeaderEpoch ||
+			status.HighWatermark != highWatermark || status.NextOffset != highWatermark || status.StartOffset > highWatermark {
+			continue
+		}
+		valid[replica.BrokerID] = struct{}{}
+	}
+	isr := make([]string, 0, len(valid))
+	for _, replicaID := range assignment.Replicas {
+		if _, ok := valid[replicaID]; ok {
+			isr = append(isr, replicaID)
+		}
+	}
+	return isr
+}
+
 func containsControllerReplica(replicas []string, brokerID string) bool {
 	for _, replica := range replicas {
 		if replica == brokerID {
@@ -188,7 +211,7 @@ func containsControllerReplica(replicas []string, brokerID string) bool {
 	return false
 }
 
-func (s *Server) selectPromotionCandidate(parent context.Context, key partitionKey, assignment controller.PartitionAssignment) (string, uint64, error) {
+func (s *Server) selectPromotionCandidate(parent context.Context, key partitionKey, assignment controller.PartitionAssignment) (string, uint64, []string, error) {
 	observed := make([]replicaObservation, 0, len(assignment.Replicas))
 	var queryErrors []error
 	for _, replicaID := range assignment.Replicas {
@@ -206,9 +229,13 @@ func (s *Server) selectPromotionCandidate(parent context.Context, key partitionK
 	}
 	candidate, highWatermark, err := choosePromotionCandidate(assignment, observed)
 	if err != nil {
-		return "", highWatermark, errors.Join(append([]error{err}, queryErrors...)...)
+		return "", highWatermark, nil, errors.Join(append([]error{err}, queryErrors...)...)
 	}
-	return candidate, highWatermark, nil
+	isr := eligiblePromotionISR(assignment, observed, highWatermark)
+	if !containsControllerReplica(isr, candidate) {
+		return "", highWatermark, nil, replication.ErrInvalidCommitState
+	}
+	return candidate, highWatermark, isr, nil
 }
 
 func (s *Server) queryPartitionReplicaStatus(ctx context.Context, brokerID string, key partitionKey) (replicationStatusResponse, error) {

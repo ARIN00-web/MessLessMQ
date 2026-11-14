@@ -31,6 +31,7 @@ func (m *metadataState) clone() metadataState {
 	}
 	for key, assignment := range m.partitions {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
+		assignment.ISR = append([]string(nil), assignment.ISR...)
 		copyState.partitions[key] = assignment
 	}
 	return copyState
@@ -47,6 +48,7 @@ func (m *metadataState) snapshot() MetadataSnapshot {
 	}
 	for key, assignment := range m.partitions {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
+		assignment.ISR = append([]string(nil), assignment.ISR...)
 		out.Partitions[key] = assignment
 	}
 	return out
@@ -83,6 +85,31 @@ func validateCommandShape(command Command) error {
 		if !leaderFound {
 			return ErrLeaderNotInReplicas
 		}
+		// Older durable logs predate ISR metadata. An omitted ISR means the
+		// complete replica set when the assignment is applied.
+		if len(a.ISR) == 0 {
+			a.ISR = a.Replicas
+		}
+		isrSeen := make(map[string]struct{}, len(a.ISR))
+		leaderInISR := false
+		for _, id := range a.ISR {
+			if _, replica := seen[id]; !replica || id == "" {
+				return ErrInvalidCommand
+			}
+			if _, duplicate := isrSeen[id]; duplicate {
+				return ErrInvalidCommand
+			}
+			isrSeen[id] = struct{}{}
+			leaderInISR = leaderInISR || id == a.Leader
+		}
+		if !leaderInISR {
+			return ErrInvalidCommand
+		}
+	case CommandUpdatePartitionISR:
+		a := command.Assignment
+		if strings.TrimSpace(a.Key.Topic) == "" || a.Key.Partition < 0 || len(a.ISR) == 0 {
+			return ErrInvalidCommand
+		}
 	case CommandNoop:
 		return nil
 	default:
@@ -111,6 +138,30 @@ func (m *metadataState) validate(command Command) error {
 		if exists && a.LeaderEpoch <= current.LeaderEpoch {
 			return ErrMetadataConflict
 		}
+	case CommandUpdatePartitionISR:
+		current, exists := m.partitions[command.Assignment.Key]
+		if !exists || command.Assignment.Leader != current.Leader || command.Assignment.LeaderEpoch != current.LeaderEpoch {
+			return ErrMetadataConflict
+		}
+		seen := make(map[string]struct{}, len(current.Replicas))
+		for _, id := range current.Replicas {
+			seen[id] = struct{}{}
+		}
+		isrSeen := make(map[string]struct{}, len(command.Assignment.ISR))
+		leaderInISR := false
+		for _, id := range command.Assignment.ISR {
+			if _, replica := seen[id]; !replica {
+				return ErrInvalidCommand
+			}
+			if _, duplicate := isrSeen[id]; duplicate {
+				return ErrInvalidCommand
+			}
+			isrSeen[id] = struct{}{}
+			leaderInISR = leaderInISR || id == current.Leader
+		}
+		if !leaderInISR {
+			return ErrInvalidCommand
+		}
 	}
 	return nil
 }
@@ -125,7 +176,15 @@ func (m *metadataState) apply(command Command) error {
 	case CommandAssignPartition:
 		a := command.Assignment
 		a.Replicas = append([]string(nil), a.Replicas...)
+		if len(a.ISR) == 0 {
+			a.ISR = append([]string(nil), a.Replicas...)
+		}
+		a.ISR = append([]string(nil), a.ISR...)
 		m.partitions[a.Key] = a
+	case CommandUpdatePartitionISR:
+		current := m.partitions[command.Assignment.Key]
+		current.ISR = append([]string(nil), command.Assignment.ISR...)
+		m.partitions[command.Assignment.Key] = current
 	case CommandNoop:
 		return nil
 	}

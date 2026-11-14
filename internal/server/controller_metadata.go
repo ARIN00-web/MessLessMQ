@@ -48,7 +48,7 @@ func buildControllerAssignments(definitions []TopicDefinition, configured map[pa
 			key := partitionKey{Topic: definition.Name, PartitionID: partitionID}
 			assignments[key] = partitionReplicaAssignment{
 				Topic: definition.Name, PartitionID: partitionID,
-				Replicas: replicas, LeaderID: replicas[0], LeaderEpoch: 1,
+				Replicas: replicas, ISR: append([]string(nil), replicas...), LeaderID: replicas[0], LeaderEpoch: 1,
 			}
 		}
 	}
@@ -103,6 +103,9 @@ func (s *Server) runControllerMetadata(ctx context.Context) {
 			}
 			if err := s.reconcilePartitionLeaders(ctx); err != nil && !errors.Is(err, controller.ErrNotLeader) && !errors.Is(err, controller.ErrNoQuorum) && !errors.Is(err, context.Canceled) {
 				s.logger.Warn("partition leader reconciliation deferred", "error", err)
+			}
+			if err := s.reconcilePartitionISR(ctx); err != nil && !errors.Is(err, controller.ErrNotLeader) && !errors.Is(err, controller.ErrNoQuorum) && !errors.Is(err, context.Canceled) {
+				s.logger.Warn("partition ISR reconciliation deferred", "error", err)
 			}
 		}
 	}
@@ -162,6 +165,7 @@ func (s *Server) reconcileControllerMetadata(parent context.Context) error {
 			Type: controller.CommandAssignPartition,
 			Assignment: controller.PartitionAssignment{
 				Key: controllerKey, Replicas: append([]string(nil), desired.Replicas...),
+				ISR:    append([]string(nil), desired.ISR...),
 				Leader: desired.LeaderID, LeaderEpoch: desired.LeaderEpoch,
 			},
 		})
@@ -192,7 +196,11 @@ func (s *Server) applyCommittedControllerMetadata() {
 		assignment := partitionReplicaAssignment{
 			Topic: key.Topic, PartitionID: uint32(key.Partition),
 			Replicas: append([]string(nil), committed.Replicas...),
+			ISR:      append([]string(nil), committed.ISR...),
 			LeaderID: committed.Leader, LeaderEpoch: committed.LeaderEpoch,
+		}
+		if len(assignment.ISR) == 0 {
+			assignment.ISR = append([]string(nil), assignment.Replicas...)
 		}
 		if containsReplica(assignment.Replicas, s.cfg.BrokerID) {
 			_, logEnd, rangeErr := partition.OffsetRange()

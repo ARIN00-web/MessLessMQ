@@ -23,6 +23,7 @@ func (r *assignmentRegistry) replace(items map[partitionKey]partitionReplicaAssi
 	copyItems := make(map[partitionKey]partitionReplicaAssignment, len(items))
 	for key, assignment := range items {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
+		assignment.ISR = append([]string(nil), assignment.ISR...)
 		copyItems[key] = assignment
 	}
 	r.mu.Lock()
@@ -38,6 +39,7 @@ func (r *assignmentRegistry) get(key partitionKey) (partitionReplicaAssignment, 
 	assignment, ok := r.items[key]
 	r.mu.RUnlock()
 	assignment.Replicas = append([]string(nil), assignment.Replicas...)
+	assignment.ISR = append([]string(nil), assignment.ISR...)
 	return assignment, ok
 }
 
@@ -50,6 +52,7 @@ func (r *assignmentRegistry) snapshot() map[partitionKey]partitionReplicaAssignm
 	out := make(map[partitionKey]partitionReplicaAssignment, len(r.items))
 	for key, assignment := range r.items {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
+		assignment.ISR = append([]string(nil), assignment.ISR...)
 		out[key] = assignment
 	}
 	return out

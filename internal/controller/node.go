@@ -78,6 +78,7 @@ func cloneEntries(entries []LogEntry) []LogEntry {
 	copy(out, entries)
 	for i := range out {
 		out[i].Command.Assignment.Replicas = append([]string(nil), entries[i].Command.Assignment.Replicas...)
+		out[i].Command.Assignment.ISR = append([]string(nil), entries[i].Command.Assignment.ISR...)
 	}
 	return out
 }
@@ -269,11 +270,16 @@ func (n *Node) HandleAppendEntries(request AppendEntriesRequest) AppendEntriesRe
 }
 
 func commandsEqual(a, b Command) bool {
-	if a.Type != b.Type || a.Broker != b.Broker || a.Assignment.Key != b.Assignment.Key || a.Assignment.Leader != b.Assignment.Leader || a.Assignment.LeaderEpoch != b.Assignment.LeaderEpoch || len(a.Assignment.Replicas) != len(b.Assignment.Replicas) {
+	if a.Type != b.Type || a.Broker != b.Broker || a.Assignment.Key != b.Assignment.Key || a.Assignment.Leader != b.Assignment.Leader || a.Assignment.LeaderEpoch != b.Assignment.LeaderEpoch || len(a.Assignment.Replicas) != len(b.Assignment.Replicas) || len(a.Assignment.ISR) != len(b.Assignment.ISR) {
 		return false
 	}
 	for i := range a.Assignment.Replicas {
 		if a.Assignment.Replicas[i] != b.Assignment.Replicas[i] {
+			return false
+		}
+	}
+	for i := range a.Assignment.ISR {
+		if a.Assignment.ISR[i] != b.Assignment.ISR[i] {
 			return false
 		}
 	}
@@ -297,6 +303,7 @@ func (n *Node) appendLocal(command Command) (LogEntry, error) {
 	}
 	entry := LogEntry{Index: uint64(len(n.log)) + 1, Term: n.currentTerm, Command: command}
 	entry.Command.Assignment.Replicas = append([]string(nil), command.Assignment.Replicas...)
+	entry.Command.Assignment.ISR = append([]string(nil), command.Assignment.ISR...)
 	n.log = append(n.log, entry)
 	return entry, nil
 }
