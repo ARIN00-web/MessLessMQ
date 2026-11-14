@@ -54,9 +54,13 @@ type PartitionAssignment struct {
 	// ISR is the controller-committed in-sync subset of Replicas.  It is kept
 	// separate from the replica assignment so a temporarily slow or failed
 	// replica does not change placement.
-	ISR         []string `json:"isr,omitempty"`
-	Leader      string   `json:"leader"`
-	LeaderEpoch uint64   `json:"leader_epoch"`
+	ISR []string `json:"isr,omitempty"`
+	// ReassignmentTarget is non-empty only while a controller-committed
+	// reassignment is staging. Replicas is then the safe union; the target
+	// becomes active only after every target enters ISR.
+	ReassignmentTarget []string `json:"reassignment_target,omitempty"`
+	Leader             string   `json:"leader"`
+	LeaderEpoch        uint64   `json:"leader_epoch"`
 }
 
 type CommandType uint8

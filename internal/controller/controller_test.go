@@ -238,6 +238,30 @@ func TestPartitionAssignmentRequiresRegisteredReplicas(t *testing.T) {
 	}
 }
 
+func TestPartitionAssignmentPersistsReassignmentTarget(t *testing.T) {
+	cluster := mustCluster(t, "a", "b", "c")
+	if err := cluster.Campaign("a"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"broker-1", "broker-2"} {
+		if err := cluster.Commit(register(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := Command{Type: CommandAssignPartition, Assignment: PartitionAssignment{Key: PartitionKey{Topic: "orders", Partition: 0}, Replicas: []string{"broker-1", "broker-2"}, ISR: []string{"broker-1"}, ReassignmentTarget: []string{"broker-2"}, Leader: "broker-1", LeaderEpoch: 1}}
+	if err := cluster.Commit(command); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := cluster.Metadata("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := metadata.Partitions[command.Assignment.Key]
+	if len(assignment.ReassignmentTarget) != 1 || assignment.ReassignmentTarget[0] != "broker-2" {
+		t.Fatalf("target = %v", assignment.ReassignmentTarget)
+	}
+}
+
 func TestAppendEntriesCannotOverwriteCommittedEntry(t *testing.T) {
 	node, _ := newNode("follower", []string{"leader", "other"})
 	seed := node.HandleAppendEntries(AppendEntriesRequest{

@@ -97,6 +97,8 @@ With `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093`, the runtime exposes:
 - `GET /metrics`
 - `GET /controller/status` (only when `CONTROLLER_VOTERS` is configured)
 - `GET /controller/metadata` (committed broker registrations and partition assignments)
+- `POST /controller/reassignments/stage` with `{"topic":"orders","partition_id":0,"replicas":["broker-2","broker-3"]}`
+- `POST /controller/reassignments/finalize` with `{"topic":"orders","partition_id":0}`
 
 The management listener is separate from the binary client listener. Do not expose it to untrusted networks. When peer membership is enabled, it also exposes `GET /cluster/members`, which returns the local broker's current membership snapshot.
 

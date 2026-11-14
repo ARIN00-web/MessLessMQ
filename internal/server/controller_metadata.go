@@ -154,6 +154,9 @@ func (s *Server) reconcileControllerMetadata(parent context.Context) error {
 		controllerKey := controller.PartitionKey{Topic: key.Topic, Partition: int(key.PartitionID)}
 		if existing, exists := metadata.Partitions[controllerKey]; exists {
 			if !assignmentMatches(existing, desired) {
+				if len(existing.ReassignmentTarget) != 0 {
+					continue
+				}
 				// Existing committed metadata is authoritative. Reassignment uses a
 				// separate staged workflow; startup reconciliation never overwrites it.
 				return fmt.Errorf("committed assignment for %s:%d differs from configured desired assignment", key.Topic, key.PartitionID)

@@ -435,6 +435,9 @@ func (s *Server) startPeerRuntime(ctx context.Context) (func(), error) {
 		go s.runControllerMetadata(runtimeCtx)
 		s.logger.Info("durable controller runtime started", "broker_id", s.cfg.BrokerID, "voters", s.cfg.ControllerVoters)
 	}
+	if s.replicator != nil && len(s.desiredAssignments) > 0 {
+		go s.runReplicaCatchup(runtimeCtx)
+	}
 	return stop, nil
 }
 
@@ -535,6 +538,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		if s.controllerRuntime != nil {
 			mux.HandleFunc("/controller/status", s.handleControllerStatus)
 			mux.HandleFunc("/controller/metadata", s.handleControllerMetadata)
+			mux.HandleFunc("/controller/reassignments/stage", s.handleStageReassignment)
+			mux.HandleFunc("/controller/reassignments/finalize", s.handleFinalizeReassignment)
 		}
 		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodGet {

@@ -23,6 +23,7 @@ import (
 const (
 	replicationBatchRecords = 128
 	replicationBatchBytes   = 16 * 1024 * 1024
+	replicaCatchupInterval  = 250 * time.Millisecond
 )
 
 type partitionKey struct {
@@ -160,6 +161,48 @@ func (a *distributedAppender) partitionLock(key partitionKey) *sync.Mutex {
 	return lock
 }
 
+// runReplicaCatchup transfers data to assigned replicas outside ISR. It never
+// changes durability accounting itself: controller ISR reconciliation admits a
+// target only after observing a matching durable high watermark and log end.
+func (s *Server) runReplicaCatchup(ctx context.Context) {
+	ticker := time.NewTicker(replicaCatchupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		for key, assignment := range s.assignmentStore.snapshot() {
+			if assignment.LeaderID != s.cfg.BrokerID {
+				continue
+			}
+			registeredTopic, err := s.registry.Get(key.Topic)
+			if err != nil {
+				continue
+			}
+			partition, err := registeredTopic.Partition(key.PartitionID)
+			if err != nil {
+				continue
+			}
+			lock := s.replicator.partitionLock(key)
+			lock.Lock()
+			for _, followerID := range assignment.Replicas {
+				if followerID == s.cfg.BrokerID || containsReplica(assignment.ISR, followerID) {
+					continue
+				}
+				if err := s.replicator.replicateFollower(partition, assignment, followerID); err != nil {
+					continue
+				}
+				if state, ok := s.commits.Get(key.Topic, key.PartitionID); ok {
+					_ = s.replicator.sendCommitMarker(assignment, followerID, state.HighWatermark)
+				}
+			}
+			lock.Unlock()
+		}
+	}
+}
+
 func (a *distributedAppender) Append(partition *topic.Partition, topicName string, value []byte, timestamp int64, ack protocol.AckMode) (uint64, error) {
 	if a == nil || partition == nil {
 		return 0, errors.New("distributed appender is not initialized")
@@ -218,17 +261,23 @@ func (a *distributedAppender) appendAndReplicate(partition *topic.Partition, ass
 	if err != nil {
 		return offset, err
 	}
-	acknowledgedFollowers := make([]string, 0, len(assignment.Replicas)-1)
+	acknowledgedFollowers := make([]string, 0, len(assignment.ISR)-1)
+	replicatedFollowers := make([]string, 0, len(assignment.Replicas)-1)
 	var replicaErrors []error
-	for _, followerID := range assignment.ISR {
+	for _, followerID := range assignment.Replicas {
 		if followerID == a.brokerID {
 			continue
 		}
 		if err := a.replicateFollower(partition, assignment, followerID); err != nil {
-			replicaErrors = append(replicaErrors, fmt.Errorf("replica %s: %w", followerID, err))
+			if containsReplica(assignment.ISR, followerID) {
+				replicaErrors = append(replicaErrors, fmt.Errorf("replica %s: %w", followerID, err))
+			}
 			continue
 		}
-		acknowledgedFollowers = append(acknowledgedFollowers, followerID)
+		replicatedFollowers = append(replicatedFollowers, followerID)
+		if containsReplica(assignment.ISR, followerID) {
+			acknowledgedFollowers = append(acknowledgedFollowers, followerID)
+		}
 	}
 	acknowledged := 1 + len(acknowledgedFollowers) // include the leader's durable append
 	if acknowledged < a.minISR {
@@ -248,12 +297,16 @@ func (a *distributedAppender) appendAndReplicate(partition *topic.Partition, ass
 	// the marker may have reached fewer than MinISR replicas.
 	commitAcks := 1
 	var commitErrors []error
-	for _, followerID := range acknowledgedFollowers {
+	for _, followerID := range replicatedFollowers {
 		if err := a.sendCommitMarker(assignment, followerID, logEnd); err != nil {
-			commitErrors = append(commitErrors, fmt.Errorf("commit marker to %s: %w", followerID, err))
+			if containsReplica(assignment.ISR, followerID) {
+				commitErrors = append(commitErrors, fmt.Errorf("commit marker to %s: %w", followerID, err))
+			}
 			continue
 		}
-		commitAcks++
+		if containsReplica(assignment.ISR, followerID) {
+			commitAcks++
+		}
 	}
 	if commitAcks < a.minISR {
 		base := fmt.Errorf("commit marker persisted on %d replicas, need %d: %w", commitAcks, a.minISR, protocol.ErrCommitUncertain)

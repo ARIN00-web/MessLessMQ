@@ -32,6 +32,7 @@ func (m *metadataState) clone() metadataState {
 	for key, assignment := range m.partitions {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
 		assignment.ISR = append([]string(nil), assignment.ISR...)
+		assignment.ReassignmentTarget = append([]string(nil), assignment.ReassignmentTarget...)
 		copyState.partitions[key] = assignment
 	}
 	return copyState
@@ -49,6 +50,7 @@ func (m *metadataState) snapshot() MetadataSnapshot {
 	for key, assignment := range m.partitions {
 		assignment.Replicas = append([]string(nil), assignment.Replicas...)
 		assignment.ISR = append([]string(nil), assignment.ISR...)
+		assignment.ReassignmentTarget = append([]string(nil), assignment.ReassignmentTarget...)
 		out.Partitions[key] = assignment
 	}
 	return out
@@ -104,6 +106,16 @@ func validateCommandShape(command Command) error {
 		}
 		if !leaderInISR {
 			return ErrInvalidCommand
+		}
+		targetSeen := make(map[string]struct{}, len(a.ReassignmentTarget))
+		for _, id := range a.ReassignmentTarget {
+			if _, replica := seen[id]; !replica || id == "" {
+				return ErrInvalidCommand
+			}
+			if _, duplicate := targetSeen[id]; duplicate {
+				return ErrInvalidCommand
+			}
+			targetSeen[id] = struct{}{}
 		}
 	case CommandUpdatePartitionISR:
 		a := command.Assignment
@@ -180,6 +192,7 @@ func (m *metadataState) apply(command Command) error {
 			a.ISR = append([]string(nil), a.Replicas...)
 		}
 		a.ISR = append([]string(nil), a.ISR...)
+		a.ReassignmentTarget = append([]string(nil), a.ReassignmentTarget...)
 		m.partitions[a.Key] = a
 	case CommandUpdatePartitionISR:
 		current := m.partitions[command.Assignment.Key]
