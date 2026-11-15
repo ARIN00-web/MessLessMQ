@@ -94,14 +94,20 @@ spec:
             periodSeconds: 2
             failureThreshold: 30
           readinessProbe:
-            tcpSocket:
-              port: client
+            httpGet:
+              path: /health/ready
+              port: admin
+              scheme: HTTP
             periodSeconds: 5
+            timeoutSeconds: 2
             failureThreshold: 3
           livenessProbe:
-            tcpSocket:
-              port: client
+            httpGet:
+              path: /health/live
+              port: admin
+              scheme: HTTP
             periodSeconds: 10
+            timeoutSeconds: 2
             failureThreshold: 3
   volumeClaimTemplates:
     - metadata:

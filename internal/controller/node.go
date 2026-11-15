@@ -316,11 +316,33 @@ func (n *Node) appendLocal(command Command) (LogEntry, error) {
 }
 
 func (n *Node) appendRequest() AppendEntriesRequest {
+	return n.appendRequestFrom(1)
+}
+
+// appendRequestFrom builds an incremental AppendEntries request beginning at
+// nextIndex. nextIndex is one-based; index 1 means the request starts at the
+// beginning of the log. The caller must retry with a lower nextIndex when the
+// follower reports a conflicting prefix. Snapshots are not supported yet, so
+// the retained log always begins at index 1.
+func (n *Node) appendRequestFrom(nextIndex uint64) AppendEntriesRequest {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if nextIndex < 1 {
+		nextIndex = 1
+	}
+	lastNext := uint64(len(n.log)) + 1
+	if nextIndex > lastNext {
+		nextIndex = lastNext
+	}
+	previousIndex := nextIndex - 1
+	previousTerm, _ := n.termAtLocked(previousIndex)
+	var entries []LogEntry
+	if nextIndex <= uint64(len(n.log)) {
+		entries = cloneEntries(n.log[nextIndex-1:])
+	}
 	return AppendEntriesRequest{
-		Term: n.currentTerm, LeaderID: n.id, PreviousLogIndex: 0,
-		PreviousLogTerm: 0, Entries: cloneEntries(n.log), LeaderCommitIndex: n.commitIndex,
+		Term: n.currentTerm, LeaderID: n.id, PreviousLogIndex: previousIndex,
+		PreviousLogTerm: previousTerm, Entries: entries, LeaderCommitIndex: n.commitIndex,
 	}
 }
 

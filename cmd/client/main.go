@@ -2,18 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
 	"hash/fnv"
-	"net"
 	"os"
 	"sort"
 	"strconv"
 	"time"
 
-	"github.com/ARIN00-web/messlessmq/internal/network"
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
+	"github.com/ARIN00-web/messlessmq/internal/security"
 	mqclient "github.com/ARIN00-web/messlessmq/mqclient"
 )
 
@@ -42,6 +42,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "Usage: messlessmq-client <produce|consume|metadata> [flags]")
+	fmt.Fprintln(os.Stderr, "Optional security: MESSLESSMQ_CLIENT_API_KEY, MESSLESSMQ_TLS_CA_FILE, MESSLESSMQ_TLS_CLIENT_CERT_FILE, MESSLESSMQ_TLS_CLIENT_KEY_FILE, MESSLESSMQ_TLS_SERVER_NAME")
 }
 
 func parseFlags(name string, args []string, setup func(*flag.FlagSet) error) error {
@@ -61,32 +62,32 @@ func (e *brokerResponseError) Error() string {
 	return fmt.Sprintf("broker returned error code %d", e.Code)
 }
 
+func newClient(address string) (*mqclient.Client, error) {
+	var tlsConfig *tls.Config
+	caFile := os.Getenv("MESSLESSMQ_TLS_CA_FILE")
+	certFile := os.Getenv("MESSLESSMQ_TLS_CLIENT_CERT_FILE")
+	keyFile := os.Getenv("MESSLESSMQ_TLS_CLIENT_KEY_FILE")
+	serverName := os.Getenv("MESSLESSMQ_TLS_SERVER_NAME")
+	if caFile != "" || certFile != "" || keyFile != "" || serverName != "" {
+		var err error
+		tlsConfig, err = security.LoadClientTLSWithCertificate(caFile, serverName, certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("configure client TLS: %w", err)
+		}
+	}
+	return mqclient.New(mqclient.Config{
+		Bootstrap: []string{address}, Timeout: 10 * time.Second,
+		MetadataTTL: 30 * time.Second, MaxRetries: 1,
+		TLSConfig: tlsConfig, APIKey: os.Getenv("MESSLESSMQ_CLIENT_API_KEY"),
+	})
+}
+
 func request(address string, api uint16, version uint16, payload []byte) (protocol.Response, error) {
-	conn, err := net.DialTimeout("tcp", address, 5*time.Second)
+	client, err := newClient(address)
 	if err != nil {
 		return protocol.Response{}, err
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	frame, err := protocol.EncodeRequest(protocol.Request{APIKey: api, APIVersion: version, CorrelationID: uint32(time.Now().UnixNano()), Payload: payload})
-	if err != nil {
-		return protocol.Response{}, err
-	}
-	if err := network.WriteFrame(conn, frame); err != nil {
-		return protocol.Response{}, err
-	}
-	responseFrame, err := network.ReadFrame(conn)
-	if err != nil {
-		return protocol.Response{}, err
-	}
-	response, err := protocol.DecodeResponse(responseFrame)
-	if err != nil {
-		return protocol.Response{}, err
-	}
-	if response.ErrorCode != protocol.ErrorNone {
-		return response, &brokerResponseError{Code: response.ErrorCode}
-	}
-	return response, nil
+	return client.Request(context.Background(), address, api, version, payload)
 }
 
 func fetchMetadata(address, topicName string) (protocol.MetadataResponse, error) {
@@ -189,7 +190,7 @@ func runProduce(args []string) error {
 		fmt.Printf("routing topic=%s partition=%d leader_address=%s\n", topicName, routedPartition, targetAddress)
 	}
 	if autoRoute {
-		clusterClient, clientErr := mqclient.New(mqclient.Config{Bootstrap: []string{address}, Timeout: 10 * time.Second, MaxRetries: 1})
+		clusterClient, clientErr := newClient(address)
 		if clientErr != nil {
 			return clientErr
 		}

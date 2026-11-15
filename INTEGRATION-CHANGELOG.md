@@ -107,3 +107,15 @@ The multi-process controller-metadata smoke test verifies three committed broker
 Safety boundaries: failover is limited to the existing committed replica set; there is no dynamic ISR removal or staged reassignment. If no follower proves a complete committed prefix (for example, it has an uncommitted suffix), promotion is refused. The storage layer has no safe in-place suffix truncation or snapshot/rebootstrap workflow yet, so such a replica may require manual rebuild. Peer RPC and admin HTTP remain plaintext/unauthenticated and must stay on trusted private networks.
 
 Validation on the isolated source tree used Go 1.23.2 (the build environment could not fetch the repository's Go 1.27.1 directive). The full test suite, race detector, `go vet`, broker/client builds, and membership, replication, controller-election, controller-metadata, and partition-leader-failover three-process smoke tests passed. The project's `go.mod` remains at Go 1.27.1 in the delivered overlay workflow; run the validations locally with the declared toolchain.
+
+
+## 2026-11-15 — client security, incremental controller replication, and reassignment verification
+
+- Added optional TLS/mTLS and binary API-key AUTH support to the reusable `mqclient` package. The CLI now consumes TLS and API-key configuration from environment variables.
+- Changed client metadata caching to key snapshots by topic, avoiding cross-topic cache reuse while preserving topic-scoped ACL enforcement.
+- Added per-follower Raft `nextIndex`/`matchIndex` tracking and conflict-hint backtracking. Controller heartbeats and proposals now send incremental AppendEntries suffixes rather than the complete log on every RPC. Snapshot fallback is intentionally not claimed or implemented.
+- Added `scripts/reassignment-smoke.sh`, a three-process test that removes a replica, produces another record, adds the replica back, waits for catch-up and committed ISR admission, finalizes reassignment, and verifies both committed records from the re-added broker.
+- Added a Kubernetes client ClusterIP service and changed liveness/readiness probes to the admin HTTP health endpoints. The headless service is retained for stable broker peer DNS.
+- Reconciled architecture, client, production-test and implementation-status documentation with the live source.
+- Added a local-only development PKI helper, a secure Docker Compose overlay, and a secure Kubernetes Kustomize overlay that consume externally supplied secrets. Generated credentials are excluded from source and Docker build contexts.
+- Added a Kubernetes ClusterIP client service and HTTP health probes; removed the admin port from the headless peer/client Service.

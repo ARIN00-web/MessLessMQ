@@ -148,7 +148,6 @@ func TestConcurrentAppends(t *testing.T) {
 	}
 }
 
-
 func TestRecoversIncompleteRecordHeader(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages")
 	if err := os.MkdirAll(path, 0755); err != nil {
@@ -179,7 +178,6 @@ func TestRecoversIncompleteRecordHeader(t *testing.T) {
 		t.Fatalf("recovered segment size = %d, want 0", info.Size())
 	}
 }
-
 
 func TestSegmentRollover(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "messages")

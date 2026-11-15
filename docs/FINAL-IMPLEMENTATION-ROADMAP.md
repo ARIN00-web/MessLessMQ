@@ -1,30 +1,78 @@
-# Final implementation roadmap
+# Final implementation status and remaining work
 
-## Audit status — 2026-11-14
+Reviewed against the current source tree on 2026-11-15.
 
-The working runtime is a persistent TCP broker with durable topic logs, versioned PRODUCE/CONSUME/METADATA APIs, controller-committed static placement, synchronous inter-broker replication, durable high-watermark markers, fixed-voter controller election, and safe in-set partition-leader failover. The active paths are `internal/server`, `internal/broker`, `internal/interbroker`, `internal/controller`, `internal/replication`, and `internal/storage`.
+## Implemented and integrated
 
-The audit found that `internal/replication.Manager` had dynamic ISR behavior, while the multi-process server used only static assignments. This was an integration gap, not merely a missing package.
+- Persistent topic catalog, segmented append-only partition logs, indexes and recovery.
+- Versioned TCP PRODUCE v1/v2, CONSUME v1/v2 and METADATA v1 APIs.
+- Seed-based membership discovery with persisted broker/cluster identity.
+- Fixed-voter durable controller election, committed metadata and controller-authority leases.
+- Synchronous inter-broker data replication, durable commit markers, high watermarks and MinISR.
+- Partition leader failure detection, safe in-set promotion, leader epochs and stale-leader fencing.
+- Controller-committed ISR reconciliation and background catch-up for replicas outside ISR.
+- Staged replica reassignment: committed union placement, background catch-up, ISR admission and guarded finalization.
+- Reusable Go client with keyed/unkeyed produce routing, consumer routing, metadata TTL, bounded stale-route retry, TLS/mTLS and AUTH.
+- GROUP v1 join/heartbeat/leave/fetch/offset commit/offset fetch handlers with durable offsets.
+- Optional client TLS/mTLS, peer TLS/mTLS, client API-key AUTH, topic ACLs and admin Bearer-key protection.
+- Docker Compose and Kubernetes deployment templates.
+- Multi-process smoke coverage for membership, replication, controller election/metadata, partition failover, reassignment/catch-up and crash/restart.
+- Per-follower Raft `nextIndex`/`matchIndex` tracking and conflict-hint backtracking for retained-log replication.
 
-## Completed in this pass
+## Remaining engineering work
 
-- Added ISR to controller partition metadata and durable Raft commands.
-- Preserved compatibility with older durable assignments by treating an omitted ISR as the full replica set.
-- Made the live appender replicate and count acknowledgements from the currently committed ISR.
-- Added controller-leader ISR reconciliation: exact log/high-watermark compatibility expands ISR; three consecutive failed or incompatible probes contract it.
-- Added focused safety tests for catch-up compatibility and transient-failure protection.
+### P0 — Raft durable log lifecycle
 
-## Next implementation stages
+- Define a versioned snapshot format that captures the complete controller metadata state and last-included index/term.
+- Persist snapshot and log-base metadata atomically with crash-safe ordering.
+- Install snapshots on lagging followers and validate checksums/identity.
+- Compact only entries covered by a durable snapshot and committed/applied state.
+- Test crashes at every snapshot publication/compaction boundary.
+- Preserve compatibility or provide a documented migration path for existing `raft-state.json` files.
 
-1. Reassignment: durable staged-plan persistence, controller-persisted intent, staged union placement, background catch-up, ISR admission, and finalization endpoints are implemented. Remaining: multi-process interrupted-reassignment and divergent-replica rebootstrap coverage.
-2. Client library: completed reusable producer/consumer APIs with metadata TTL, round-robin unkeyed placement, bounded retry and explicit uncertain-append errors. The CLI producer uses it; next, add TLS connection support.
-3. Consumer groups: GROUP v1 join, heartbeat, leave, owned fetch, offset commit/fetch, durable offsets, and session expiry are implemented. Remaining: controller-selected/recoverable coordinator placement and multi-process group tests.
-4. Security: optional TLS/mTLS is integrated for peer transport; binary AUTH and topic ACL enforcement are integrated. Remaining work is certificate-subject-to-broker identity verification, multi-principal credential management, and certificate rotation automation.
-5. Controller hardening: per-follower replication progress/backtracking, snapshot installation/compaction, and deterministic partition fault tests.
-6. Operations: controller APIs for topic/reassignment status, peer-authenticated admin controls, lag/ISR metrics, and deployment security defaults.
+### P1 — Consensus and membership hardening
 
-## Risks and acceptance criteria
+- Add deterministic model/fault tests for partition, delayed/duplicate RPC, stale terms, restart and quorum recovery.
+- Add a proven joint-consensus or equivalent safe protocol before changing voter sets; do not edit voter arrays live without it.
+- Add peer certificate identity binding and authenticated membership updates.
+- Add membership failure detection/removal only with explicit safety semantics; discovery snapshots alone are not authoritative membership.
 
-The ISR reconciler intentionally fails closed: a replica is admitted only when its log end and durable high watermark exactly equal the leader's observed state. It never truncates a divergent suffix. This protects committed data, but a divergent or retention-behind replica still needs rebootstrap.
+### P2 — Data replica repair
 
-Before controlled staging, the next stages must provide authenticated peer transport, rebootstrap/reassignment recovery, reusable clients, and network/disk fault coverage. A production claim additionally requires measured load behavior, secure secret rotation, and a full Raft safety review.
+- Design safe snapshot/rebootstrap for replicas behind retention or with divergent uncommitted tails.
+- Persist and resume interrupted reassignment plans across controller failover/restart.
+- Add reassignments under leader failure and controller loss.
+- Add configurable ISR lag/time policies and metrics.
+
+### P3 — Consumer group coordination
+
+- Define deterministic coordinator ownership or a controller-committed coordinator map.
+- Forward group requests to the owner and persist/recover membership generations safely.
+- Test coordinator failure, broker restart, group generation fencing and concurrent rebalances across three processes.
+- Add static membership and cooperative rebalancing only after eager rebalance safety is established.
+
+### P4 — Client and topic administration
+
+- Add a public GroupSession API with explicit coordinator affinity until distributed coordination is available.
+- Add reusable connection pooling only with correct deadline/cancellation behavior.
+- Add a controller-committed topic catalog and versioned create/delete/partition expansion APIs.
+- Add idempotent producer sessions and explicit handling for uncertain outcomes before claiming exactly-once delivery.
+
+### P5 — Production operations/security
+
+- Add certificate rotation/reload and broker-ID-to-certificate identity binding.
+- Add per-principal credentials and audit trails.
+- Add authenticated admin controls by default in production profiles.
+- Add network partition, disk-full, storage corruption, long-running soak and measured load/SLO tests.
+- Verify Go 1.27.1 builds and execute Docker Compose/Kind/Kubernetes deployment tests in the target environment.
+
+## Validation commands
+
+```bash
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+go build ./cmd/broker ./cmd/client
+```
+
+Multi-process smoke scripts are listed in `docs/architecture-review.md`. The release assessment must distinguish local tests, multi-process smoke tests, and real deployment/chaos evidence.

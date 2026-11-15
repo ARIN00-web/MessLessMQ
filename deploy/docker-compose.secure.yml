@@ -1,0 +1,51 @@
+# Optional security overlay. Generate local development credentials first:
+#   ./scripts/generate-dev-certs.sh
+# Then set MESSLESSMQ_CLIENT_API_KEY and MESSLESSMQ_ADMIN_API_KEY in the shell.
+# Start with:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.secure.yml up --build -d
+x-secure-broker: &secure-broker
+  environment: &secure-environment
+    MESSLESSMQ_TLS_CLIENT_CA_FILE: /run/messlessmq/secrets/ca.crt
+    MESSLESSMQ_REQUIRE_CLIENT_CERT: "true"
+    MESSLESSMQ_PEER_TLS_CA_FILE: /run/messlessmq/secrets/ca.crt
+    MESSLESSMQ_REQUIRE_PEER_CERT: "true"
+    MESSLESSMQ_CLIENT_API_KEY: ${MESSLESSMQ_CLIENT_API_KEY:?Set MESSLESSMQ_CLIENT_API_KEY}
+    MESSLESSMQ_ADMIN_API_KEY: ${MESSLESSMQ_ADMIN_API_KEY:?Set MESSLESSMQ_ADMIN_API_KEY}
+
+services:
+  broker-1:
+    <<: *secure-broker
+    volumes:
+      - ./secrets/ca.crt:/run/messlessmq/secrets/ca.crt:ro
+      - ./secrets/broker-1.crt:/run/messlessmq/secrets/broker-1.crt:ro
+      - ./secrets/broker-1.key:/run/messlessmq/secrets/broker-1.key:ro
+    environment:
+      <<: *secure-environment
+      MESSLESSMQ_TLS_CERT_FILE: /run/messlessmq/secrets/broker-1.crt
+      MESSLESSMQ_TLS_KEY_FILE: /run/messlessmq/secrets/broker-1.key
+      MESSLESSMQ_PEER_TLS_CERT_FILE: /run/messlessmq/secrets/broker-1.crt
+      MESSLESSMQ_PEER_TLS_KEY_FILE: /run/messlessmq/secrets/broker-1.key
+  broker-2:
+    <<: *secure-broker
+    volumes:
+      - ./secrets/ca.crt:/run/messlessmq/secrets/ca.crt:ro
+      - ./secrets/broker-2.crt:/run/messlessmq/secrets/broker-2.crt:ro
+      - ./secrets/broker-2.key:/run/messlessmq/secrets/broker-2.key:ro
+    environment:
+      <<: *secure-environment
+      MESSLESSMQ_TLS_CERT_FILE: /run/messlessmq/secrets/broker-2.crt
+      MESSLESSMQ_TLS_KEY_FILE: /run/messlessmq/secrets/broker-2.key
+      MESSLESSMQ_PEER_TLS_CERT_FILE: /run/messlessmq/secrets/broker-2.crt
+      MESSLESSMQ_PEER_TLS_KEY_FILE: /run/messlessmq/secrets/broker-2.key
+  broker-3:
+    <<: *secure-broker
+    volumes:
+      - ./secrets/ca.crt:/run/messlessmq/secrets/ca.crt:ro
+      - ./secrets/broker-3.crt:/run/messlessmq/secrets/broker-3.crt:ro
+      - ./secrets/broker-3.key:/run/messlessmq/secrets/broker-3.key:ro
+    environment:
+      <<: *secure-environment
+      MESSLESSMQ_TLS_CERT_FILE: /run/messlessmq/secrets/broker-3.crt
+      MESSLESSMQ_TLS_KEY_FILE: /run/messlessmq/secrets/broker-3.key
+      MESSLESSMQ_PEER_TLS_CERT_FILE: /run/messlessmq/secrets/broker-3.crt
+      MESSLESSMQ_PEER_TLS_KEY_FILE: /run/messlessmq/secrets/broker-3.key

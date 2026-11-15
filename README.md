@@ -2,7 +2,7 @@
 
 MessLessMQ is a from-scratch Go message broker project. Each broker process provides a persistent TCP data path with durable topics/partitions, PRODUCE, CONSUME, and METADATA APIs, a small CLI, optional TLS/mTLS, metrics, health endpoints, request limits, and graceful shutdown. An optional peer listener supports seed-based broker membership discovery and a fixed-voter, durable Raft controller election across independent processes.
 
-The repository contains implementations of replication, controller consensus, cluster metadata, inter-broker transport, consumer groups, offset management, and recovery. Broker membership, synchronous remote record replication, durable commit markers, fixed-voter controller elections, and Raft-committed broker/partition metadata are wired across independent processes. Each broker applies only committed controller assignments to its live metadata and replication routing view. The elected controller can promote an eligible in-set partition replica under a higher leader epoch after repeated leader-probe failures; keyed CLI produce refreshes metadata and routes to the new leader. It also commits conservative ISR changes after verified catch-up or three consecutive failed/incompatible replica probes. Staged reassignment and safe rebootstrap of divergent replicas remain future work.
+The repository integrates replication, fixed-voter controller consensus, committed cluster metadata, inter-broker transport, consumer groups, durable offsets, recovery, conservative controller-committed ISR tracking, background replica catch-up, and staged replica reassignment. The controller promotes only an eligible in-set partition replica under a higher leader epoch after repeated leader-probe failures. The reusable Go client and CLI route keyed and unkeyed production and consumer fetches using cached metadata, with bounded stale-route refresh. The client supports optional TLS/mTLS and API-key AUTH. Divergent replica rebootstrap, Raft snapshots/compaction, dynamic voter reconfiguration, and distributed consumer-group coordinator recovery remain unfinished.
 
 See [docs/architecture-review.md](docs/architecture-review.md) for the implemented boundary and remaining distributed-runtime work.
 
@@ -84,14 +84,17 @@ The broker reads environment variables prefixed with `MESSLESSMQ_`:
 | `HEARTBEAT_INTERVAL` | Controller heartbeat interval; default `200ms` and must be less than half the minimum election timeout |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | Optional server TLS certificate/key pair |
 | `TLS_CLIENT_CA_FILE`, `REQUIRE_CLIENT_CERT` | Optional mutual TLS client verification |
+| `TLS_CA_FILE`, `TLS_CLIENT_CERT_FILE`, `TLS_CLIENT_KEY_FILE`, `TLS_SERVER_NAME` | CLI/Go-client trust root, optional client certificate and expected broker DNS name |
 | `PEER_TLS_CERT_FILE`, `PEER_TLS_KEY_FILE`, `PEER_TLS_CA_FILE` | Optional TLS certificate/key and trust CA for inter-broker traffic |
 | `REQUIRE_PEER_CERT` | Require and verify a client certificate on the peer listener; requires peer TLS certificate/key and CA |
+| `CLIENT_API_KEY`, `CLIENT_ACL` | Optional binary client authentication and topic/action ACL rules |
+| `ADMIN_API_KEY` | Optional Bearer-key protection for admin HTTP routes |
 | `ADMIN_ADDRESS` | Optional separate HTTP health/metrics listener; bind privately even when an API key is configured |
 | `ADMIN_API_KEY` | Optional Bearer token protecting admin/diagnostic routes; health probes remain unauthenticated |
 | `CLIENT_API_KEY` | Optional binary TCP AUTH token; clients must authenticate once per connection before normal requests |
 | `CLIENT_ACL` | Optional semicolon-separated `role:topic:action` rules, e.g. `client:orders:produce;client:orders:consume` |
 
-For TLS, configure `TLS_CERT_FILE` and `TLS_KEY_FILE`. For mTLS, also configure `TLS_CLIENT_CA_FILE` and set `REQUIRE_CLIENT_CERT=true`. The included CLI currently supports plaintext TCP only; use a TLS-capable client for a TLS-enabled listener.
+For TLS, configure `TLS_CERT_FILE` and `TLS_KEY_FILE`. For mTLS, also configure `TLS_CLIENT_CA_FILE` and set `REQUIRE_CLIENT_CERT=true`. The reusable Go client and CLI support TLS/mTLS and AUTH. The CLI reads `MESSLESSMQ_CLIENT_API_KEY`, `MESSLESSMQ_TLS_CA_FILE`, `MESSLESSMQ_TLS_CLIENT_CERT_FILE`, `MESSLESSMQ_TLS_CLIENT_KEY_FILE`, and `MESSLESSMQ_TLS_SERVER_NAME` from the environment. Configure the TLS CA and expected server name when connecting to a TLS-enabled listener.
 
 ## Runtime operations
 
@@ -141,7 +144,7 @@ go run ./cmd/broker
 
 If `MESSLESSMQ_ADMIN_ADDRESS=127.0.0.1:9093` is configured, inspect a broker's current membership with `curl http://127.0.0.1:9093/cluster/members`.
 
-For brokers with peer membership enabled, the broker persists `cluster_id` and `broker_id` in `<DATA_DIR>/metadata/identity.json`. Reusing that data directory with a different cluster or broker ID is rejected. Give every broker its own data directory/PVC. Peer join currently uses plaintext, unauthenticated TCP and has no heartbeat-based membership removal. Keep peer listeners on a trusted private network. Membership snapshots are per-process and in-memory; they are discovery information, not a consensus-committed controller view. The membership subsystem itself does not replicate records or elect partition leaders; those are separate runtime features described below.
+For brokers with peer membership enabled, the broker persists `cluster_id` and `broker_id` in `<DATA_DIR>/metadata/identity.json`. Reusing that data directory with a different cluster or broker ID is rejected. Give every broker its own data directory/PVC. Peer TLS/mTLS can be enabled with `PEER_TLS_CERT_FILE`, `PEER_TLS_KEY_FILE`, `PEER_TLS_CA_FILE`, and `REQUIRE_PEER_CERT=true`. Membership still has no heartbeat-based removal protocol; membership snapshots are discovery information, not a consensus-committed controller view. Peer certificate identity is not yet bound to the claimed broker ID, so keep peer traffic on a trusted network even when TLS is enabled.
 See [CLUSTER-MEMBERSHIP-GUIDE.md](CLUSTER-MEMBERSHIP-GUIDE.md) for a three-terminal local setup. `scripts/membership-smoke.sh` builds and launches three separate broker OS processes with isolated temporary data directories, then verifies that each admin membership endpoint reports all three brokers.
 
 ## Controller-committed cluster metadata and replication
@@ -159,7 +162,7 @@ After all configured voters are visible through membership, the elected controll
 
 Controller term, vote, log, and commit index persist under `<DATA_DIR>/metadata/controller/raft-state.json`. A restarted voter comes back as a follower. Data replication uses independent per-broker commit stores under `<DATA_DIR>/metadata/commits/`; consumers hide offsets at or beyond their local exclusive high watermark.
 
-The controller commits broker registration, partition assignment, and conservative ISR metadata for a fixed voter set. Existing committed assignments are authoritative and startup reconciliation will not overwrite them. When the current partition leader becomes unreachable, the elected controller probes it repeatedly, verifies the other assigned replicas' durable commit state, and commits a new leader with an incremented epoch only if a replica's log ends exactly at the highest observed high watermark. The old leader's controller-authority lease fences it from further writes after lease expiry. A follower is admitted to ISR only after its durable high watermark and physical log end match the leader; it is removed only after three consecutive incompatible or failed probes. Keyed CLI produce refreshes METADATA and routes to the new leader. Staged replica reassignment and automatic routing for unkeyed produce/consumer fetch are not implemented. The current peer protocol is plaintext and unauthenticated; keep peer and admin listeners on trusted private networks.
+The controller commits broker registration, partition assignment, conservative ISR metadata, and staged reassignment intent for a fixed voter set. Existing committed assignments are authoritative and startup reconciliation will not overwrite them. When the current partition leader becomes unreachable, the elected controller probes it repeatedly, verifies the other assigned replicas' durable commit state, and commits a new leader with an incremented epoch only if a replica's log ends exactly at the highest observed high watermark. The old leader's controller-authority lease fences it from further writes after lease expiry. A follower is admitted to ISR only after its durable high watermark and physical log end match the leader; it is removed only after three consecutive incompatible or failed probes. Background catch-up copies to replicas outside ISR. Staged reassignment commits a union replica set, waits for target ISR admission, and only then finalizes the target set. The Go client supports keyed/unkeyed produce and consumer fetch routing. Peer TLS/mTLS is available but peer certificate identity binding and membership failure/removal remain incomplete.
 
 `scripts/controller-metadata-smoke.sh` starts three independent broker processes, verifies committed broker and partition metadata, checks the normal METADATA API, and produces/consumes a record from both follower logs. `scripts/replication-smoke.sh` verifies durable record replication, commit markers, committed-read filtering, and MinISR behavior. `scripts/controller-election-smoke.sh` verifies controller-leader replacement after process failure and old-voter rejoin. `scripts/partition-leader-failover-smoke.sh` kills a partition leader, verifies safe controller-committed promotion, routes keyed production to the new leader, restarts the old broker, and verifies replica catch-up. See [CONTROLLER-ELECTION-GUIDE.md](CONTROLLER-ELECTION-GUIDE.md), [CONTROLLER-METADATA-GUIDE.md](CONTROLLER-METADATA-GUIDE.md), and [PARTITION-LEADER-FAILOVER-GUIDE.md](PARTITION-LEADER-FAILOVER-GUIDE.md).
 
@@ -209,6 +212,16 @@ go vet ./...
 ./scripts/partition-leader-failover-smoke.sh
 ```
 
+```bash
+./scripts/reassignment-smoke.sh
+```
+
+Run all package and multi-process smoke checks with:
+
+```bash
+./scripts/smoke-all.sh
+```
+
 `scripts/crash-restart.sh` requires `nc` and port `19092` to be free. It produces a synchronously acknowledged record, sends SIGKILL to the broker, restarts it on the same temporary data directory, and verifies the record is still readable. This tests local log durability/recovery, not replication.
 
 ## Docker Compose
@@ -218,6 +231,10 @@ docker compose -f deploy/docker-compose.yml up --build -d
 ```
 
 The three services listen on host ports `19092`, `19093`, and `19094`. Each has a separate named data volume, seed-based membership discovery, and the same fixed three-voter controller set. With no explicit replica map, the controller commits a deterministic full-replica assignment for each bootstrap topic partition; the manifests set `MESSLESSMQ_MIN_ISR=2`. Their admin endpoints are published only on loopback host ports `19101`, `19102`, and `19103`. Inspect membership with `/cluster/members`, controller state with `/controller/status`, and committed assignments with `/controller/metadata`.
+
+## Secure local development
+
+Generate local development credentials with `./scripts/generate-dev-certs.sh`, then follow [docs/SECURITY.md](docs/SECURITY.md) to start the secure Docker Compose overlay or apply the secure Kubernetes Kustomize overlay. The generated certificates are not production PKI material.
 
 ## Kubernetes
 
@@ -232,7 +249,7 @@ kind load docker-image messlessmq:integrated --name messlessmq
 ```
 
 ```bash
-kubectl apply -f deploy/kubernetes/
+kubectl apply -k deploy/kubernetes/
 ```
 
 Check storage support before applying the StatefulSet:
@@ -245,13 +262,12 @@ The StatefulSet requests one 5Gi persistent volume claim per pod; the cluster mu
 
 ## Security and feature boundaries
 
-- New runtime-produced messages wrap key/value in a CRC32-checked internal envelope.
-- API-key authentication and ACL packages exist but are not wired into the live custom TCP request pipeline.
-- Runtime rate limiting is keyed by remote IP rather than authenticated principal.
-- Consumer group coordination and durable offset APIs exist as packages but are not exposed end-to-end through the public request protocol.
-- Broker registrations and initial partition assignments are proposed, majority-committed, and applied from the fixed-voter controller log.
-- Remote record replication and durable commit markers use the committed assignment view when controller mode is enabled.
-- Controller-driven partition leader promotion and conservative controller-committed ISR tracking are implemented; staged replica reassignment is not. The keyed CLI producer auto-routes and refreshes once; unkeyed produce and consumer fetch routing are not automatic.
-- Peer RPCs are plaintext and unauthenticated; admin endpoints are unauthenticated and must remain private. Consumer-group membership and offset commit/fetch are not yet exposed as a complete wire protocol.
+- Client TLS/mTLS, peer TLS/mTLS, binary API-key AUTH, topic ACLs, and optional admin Bearer-key protection are integrated into the live request paths.
+- The default Docker Compose/Kubernetes manifests are development/lab configurations; they do not provision certificates or secrets. Peer/admin listeners must remain on trusted networks until deployment security is configured.
+- Peer TLS verifies certificate trust and advertised hostnames, but does not yet bind certificate identity to broker IDs.
+- Consumer GROUP v1 operations are exposed over the wire and offsets are durable. Group membership/assignments remain local to one broker process and in-memory; coordinator failover requires members to rejoin.
+- Controller proposals use a fixed voter set. Per-follower `nextIndex`/`matchIndex` and conflict-hint backtracking are implemented, but snapshots, snapshot install, log compaction, and voter reconfiguration are not.
+- Dynamic ISR and staged replica reassignment are implemented with catch-up-before-admission/finalization. Automatic divergent-replica truncation/rebootstrap is not implemented.
+- The reusable Go client and CLI support keyed/unkeyed produce routing, consumer fetch routing, metadata caching, TLS and API-key AUTH. Uncertain producer outcomes are not automatically retried.
 
-Do not describe the current build as a production-ready replicated Kafka replacement. It is a functioning persistent broker cluster with fixed-voter controller elections, committed broker/partition metadata, synchronous inter-process replication, committed-read boundaries, and automatic in-set partition leader failover with keyed CLI routing. It still needs secure peer RPCs, dynamic reassignment/ISR, a divergent-replica rebootstrap path, broader client routing, and deeper chaos testing.
+Do not describe the current build as a production-ready Kafka replacement. It is a functioning persistent multi-broker system with synchronous replication, committed-read boundaries, fixed-voter controller metadata, partition failover, ISR tracking, staged reassignment, client routing, and a versioned consumer-group API. Remaining production work includes Raft snapshot/recovery, safe voter changes, distributed group coordinator recovery, divergent replica rebootstrap, peer identity authorization, credential rotation, and broader chaos/soak/load testing.

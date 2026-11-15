@@ -1,7 +1,19 @@
 package client
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net"
 	"testing"
+	"time"
+
+	"github.com/ARIN00-web/messlessmq/internal/network"
 
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 )
@@ -52,4 +64,128 @@ func TestResponseRetryClassificationExcludesUncertainOutcome(t *testing.T) {
 	if isStaleRoute(&ResponseError{Code: protocol.ErrorCommitUncertain}) {
 		t.Fatal("uncertain append must not be retried")
 	}
+}
+
+func TestClientUsesTLSAndAuthenticatesEachConnection(t *testing.T) {
+	cert, roots := testTLSCertificate(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			serverErr <- acceptErr
+			return
+		}
+		defer conn.Close()
+		for i := 0; i < 2; i++ {
+			frame, readErr := network.ReadFrame(conn)
+			if readErr != nil {
+				serverErr <- readErr
+				return
+			}
+			request, decodeErr := protocol.DecodeRequest(frame)
+			if decodeErr != nil {
+				serverErr <- decodeErr
+				return
+			}
+			var payload []byte
+			if i == 0 {
+				if request.APIKey != protocol.APIAUTH {
+					serverErr <- fmt.Errorf("first request API = %d, want AUTH", request.APIKey)
+					return
+				}
+				auth, authErr := protocol.DecodeAuthRequest(request.Payload)
+				if authErr != nil || auth.Token != "test-secret" {
+					serverErr <- fmt.Errorf("unexpected auth request: token=%q err=%v", auth.Token, authErr)
+					return
+				}
+				payload, decodeErr = protocol.EncodeAuthResponse(protocol.AuthResponse{PrincipalID: "test-client"})
+			} else {
+				if request.APIKey != protocol.APIMETADATA {
+					serverErr <- fmt.Errorf("second request API = %d, want METADATA", request.APIKey)
+					return
+				}
+				metadataRequest, requestErr := protocol.DecodeMetadataRequest(request.Payload)
+				if requestErr != nil || metadataRequest.Topic != "orders" {
+					serverErr <- fmt.Errorf("metadata request should preserve topic scope: topic=%q err=%v", metadataRequest.Topic, requestErr)
+					return
+				}
+				payload, decodeErr = protocol.EncodeMetadataResponse(protocol.MetadataResponse{Version: 7})
+			}
+			if decodeErr != nil {
+				serverErr <- decodeErr
+				return
+			}
+			response, encodeErr := protocol.EncodeResponse(protocol.Response{APIKey: request.APIKey, APIVersion: request.APIVersion, CorrelationID: request.CorrelationID, Payload: payload})
+			if encodeErr != nil {
+				serverErr <- encodeErr
+				return
+			}
+			if writeErr := network.WriteFrame(conn, response); writeErr != nil {
+				serverErr <- writeErr
+				return
+			}
+		}
+		serverErr <- nil
+	}()
+
+	client, err := New(Config{
+		Bootstrap: []string{listener.Addr().String()},
+		APIKey:    "test-secret",
+		TLSConfig: &tls.Config{RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS12},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := client.Metadata(context.Background(), "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Version != 7 {
+		t.Fatalf("metadata version = %d, want 7", metadata.Version)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testTLSCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certificate, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(parsed)
+	return certificate, roots
 }

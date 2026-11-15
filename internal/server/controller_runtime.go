@@ -40,6 +40,10 @@ type controllerRuntime struct {
 	lastLeaderContact atomic.Int64
 	lastQuorumContact atomic.Int64
 	proposalMu        sync.Mutex
+	progressMu        sync.Mutex
+	nextIndex         map[string]uint64
+	matchIndex        map[string]uint64
+	peerReplicationMu map[string]*sync.Mutex
 	onCommit          func()
 }
 
@@ -73,7 +77,8 @@ func newControllerRuntime(brokerID string, voters []string, node *controller.Dur
 		transport: interbroker.NewTransport(cfg.RequestTimeout), logger: logger,
 		electionMin: cfg.ElectionTimeoutMin, electionMax: cfg.ElectionTimeoutMax,
 		heartbeat: cfg.HeartbeatInterval, rpcTimeout: minDuration(cfg.RequestTimeout, 500*time.Millisecond),
-		contact: make(chan struct{}, 1),
+		contact: make(chan struct{}, 1), nextIndex: make(map[string]uint64),
+		matchIndex: make(map[string]uint64), peerReplicationMu: make(map[string]*sync.Mutex),
 	}, nil
 }
 
@@ -271,11 +276,25 @@ func (r *controllerRuntime) campaign(parent context.Context) error {
 // quorum. The leader persists its entry first, replicates it to a majority,
 // commits locally, then advertises the new commit index to followers.
 func (r *controllerRuntime) Propose(parent context.Context, command controller.Command) error {
+	return r.propose(parent, command, nil)
+}
+
+// ProposeAtVersion performs an optimistic metadata compare-and-swap. It is
+// used by multi-step admin workflows so a concurrent ISR/leader update cannot
+// be overwritten by a proposal built from an older metadata snapshot.
+func (r *controllerRuntime) ProposeAtVersion(parent context.Context, command controller.Command, expectedVersion uint64) error {
+	return r.propose(parent, command, &expectedVersion)
+}
+
+func (r *controllerRuntime) propose(parent context.Context, command controller.Command, expectedVersion *uint64) error {
 	if r == nil || r.node == nil || parent == nil {
 		return controller.ErrInvalidConfig
 	}
 	r.proposalMu.Lock()
 	defer r.proposalMu.Unlock()
+	if expectedVersion != nil && r.node.Metadata().Version != *expectedVersion {
+		return controller.ErrMetadataConflict
+	}
 
 	initial := r.node.Status()
 	if initial.Role != controller.RoleLeader || initial.LeaderID != r.brokerID {
@@ -285,29 +304,17 @@ func (r *controllerRuntime) Propose(parent context.Context, command controller.C
 	if err != nil {
 		return err
 	}
-	request := r.node.AppendRequest()
-	if request.Term != entry.Term || request.LeaderID != r.brokerID {
-		return controller.ErrNotLeader
-	}
-
 	type result struct {
-		peerID   string
-		response controller.AppendEntriesResponse
-		err      error
+		peerID string
+		err    error
 	}
 	peers := r.peerIDs()
 	results := make(chan result, len(peers))
 	for _, peerID := range peers {
 		peerID := peerID
 		go func() {
-			var response controller.AppendEntriesResponse
-			err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response)
-			if err == nil && response.Term > request.Term {
-				if persistErr := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); persistErr != nil {
-					r.logger.Error("persist higher controller term from heartbeat", "peer_id", peerID, "error", persistErr)
-				}
-			}
-			results <- result{peerID: peerID, response: response, err: err}
+			_, replicateErr := r.replicatePeer(parent, peerID, entry.Term)
+			results <- result{peerID: peerID, err: replicateErr}
 		}()
 	}
 
@@ -317,20 +324,14 @@ func (r *controllerRuntime) Propose(parent context.Context, command controller.C
 		case <-parent.Done():
 			return parent.Err()
 		case result := <-results:
-			if result.err != nil {
-				continue
-			}
-			if result.response.Term > request.Term {
-				if err := r.node.RecordVote(result.peerID, controller.VoteResponse{Term: result.response.Term}); err != nil {
-					return err
-				}
-				return controller.ErrNotLeader
-			}
-			if result.response.Success && result.response.Term == request.Term {
+			if result.err == nil {
 				replicated++
+			} else if errors.Is(result.err, controller.ErrNotLeader) {
+				return result.err
 			}
 		}
 	}
+
 	if replicated < r.majority() {
 		return controller.ErrNoQuorum
 	}
@@ -357,25 +358,17 @@ func (r *controllerRuntime) sendHeartbeats(parent context.Context) {
 	if status.Role != controller.RoleLeader {
 		return
 	}
-	request := r.node.AppendRequest()
-	peers := r.peerIDs()
 	type result struct {
-		peerID   string
-		response controller.AppendEntriesResponse
-		err      error
+		peerID string
+		err    error
 	}
+	peers := r.peerIDs()
 	results := make(chan result, len(peers))
 	for _, peerID := range peers {
 		peerID := peerID
 		go func() {
-			var response controller.AppendEntriesResponse
-			err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response)
-			if err == nil && response.Term > request.Term {
-				if persistErr := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); persistErr != nil {
-					r.logger.Error("persist higher controller term from heartbeat", "peer_id", peerID, "error", persistErr)
-				}
-			}
-			results <- result{peerID: peerID, response: response, err: err}
+			_, err := r.replicatePeer(parent, peerID, status.Term)
+			results <- result{peerID: peerID, err: err}
 		}()
 	}
 	acknowledgements := 1 // this node's durable state
@@ -388,18 +381,124 @@ func (r *controllerRuntime) sendHeartbeats(parent context.Context) {
 		case <-parent.Done():
 			return
 		case result := <-results:
-			if result.err == nil && result.response.Term == request.Term && result.response.Success {
+			if result.err == nil {
 				acknowledgements++
 			}
 			if acknowledgements >= r.majority() {
 				current := r.node.Status()
-				if current.Role == controller.RoleLeader && current.Term == request.Term {
+				if current.Role == controller.RoleLeader && current.Term == status.Term {
 					r.lastQuorumContact.Store(time.Now().UnixNano())
 				}
 				return
 			}
 		}
 	}
+}
+
+// replicatePeer maintains Raft's per-follower nextIndex/matchIndex state and
+// backs nextIndex up using the follower's conflict hint until the log prefix
+// matches. This avoids retransmitting the complete controller log on every
+// heartbeat/proposal. It deliberately has no snapshot fallback: nextIndex is
+// bounded by the retained log's first index (1) until snapshot installation is
+// implemented as a coordinated storage/recovery feature.
+func (r *controllerRuntime) replicatePeer(parent context.Context, peerID string, term uint64) (uint64, error) {
+	if parent == nil {
+		return 0, controller.ErrInvalidConfig
+	}
+	lock := r.peerReplicationLock(peerID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	status := r.node.Status()
+	if status.Role != controller.RoleLeader || status.Term != term || status.LeaderID != r.brokerID {
+		return 0, controller.ErrNotLeader
+	}
+	nextIndex := r.followerNextIndex(peerID, status.LastLogIndex+1)
+	maxAttempts := int(status.LastLogIndex) + 2
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := parent.Err(); err != nil {
+			return 0, err
+		}
+		request := r.node.AppendRequestFrom(nextIndex)
+		if request.Term != term || request.LeaderID != r.brokerID {
+			return 0, controller.ErrNotLeader
+		}
+		var response controller.AppendEntriesResponse
+		if err := r.callPeer(parent, peerID, interbroker.MessageAppendEntries, request, &response); err != nil {
+			return 0, err
+		}
+		if response.Term > term {
+			if err := r.node.RecordVote(peerID, controller.VoteResponse{Term: response.Term}); err != nil {
+				return 0, err
+			}
+			return 0, controller.ErrNotLeader
+		}
+		if response.Term != term {
+			return 0, controller.ErrNotLeader
+		}
+		if response.Success {
+			matched := request.PreviousLogIndex + uint64(len(request.Entries))
+			r.setFollowerProgress(peerID, matched+1, matched)
+			return matched, nil
+		}
+
+		candidate := response.ConflictIndex
+		if candidate == 0 || candidate >= nextIndex {
+			if nextIndex <= 1 {
+				return 0, fmt.Errorf("follower %s rejected log prefix at index 1: %w", peerID, controller.ErrLogInvariant)
+			}
+			candidate = nextIndex - 1
+		}
+		if candidate < 1 {
+			candidate = 1
+		}
+		r.setFollowerNextIndex(peerID, candidate)
+		nextIndex = candidate
+	}
+	return 0, fmt.Errorf("follower %s did not converge after %d AppendEntries attempts: %w", peerID, maxAttempts, controller.ErrLogInvariant)
+}
+
+func (r *controllerRuntime) peerReplicationLock(peerID string) *sync.Mutex {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	lock := r.peerReplicationMu[peerID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		r.peerReplicationMu[peerID] = lock
+	}
+	return lock
+}
+
+func (r *controllerRuntime) followerNextIndex(peerID string, fallback uint64) uint64 {
+	r.progressMu.Lock()
+	defer r.progressMu.Unlock()
+	if next, ok := r.nextIndex[peerID]; ok && next > 0 {
+		return next
+	}
+	if fallback < 1 {
+		fallback = 1
+	}
+	r.nextIndex[peerID] = fallback
+	return fallback
+}
+
+func (r *controllerRuntime) setFollowerNextIndex(peerID string, next uint64) {
+	if next < 1 {
+		next = 1
+	}
+	r.progressMu.Lock()
+	r.nextIndex[peerID] = next
+	r.progressMu.Unlock()
+}
+
+func (r *controllerRuntime) setFollowerProgress(peerID string, next, matched uint64) {
+	if next < 1 {
+		next = 1
+	}
+	r.progressMu.Lock()
+	r.nextIndex[peerID] = next
+	r.matchIndex[peerID] = matched
+	r.progressMu.Unlock()
 }
 
 func (r *controllerRuntime) peerIDs() []string {

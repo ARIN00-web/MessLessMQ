@@ -14,16 +14,17 @@ This plan distinguishes package tests, the persistent broker runtime, multi-proc
 | Replication/commit | `scripts/replication-smoke.sh` | Real record copies to followers, durable commit markers, committed-read filtering, and MinISR behavior | Dynamic leader election or automatic replica reassignment |
 | Controller election | `scripts/controller-election-smoke.sh` | Three broker processes elect one controller leader, elect a replacement after its process stops, and restart the old voter from durable state as a follower | Dynamic voter reconfiguration and full partition failover |
 | Controller metadata | `scripts/controller-metadata-smoke.sh` | Three broker registrations and partition assignments are committed by the controller, applied on all brokers, exposed by METADATA, and used by replication | Dynamic placement/reassignment |
-| Partition leader failover | `scripts/partition-leader-failover-smoke.sh` | Detects a failed partition leader, promotes only an assigned replica with a complete committed prefix, refreshes keyed client metadata, continues writes/reads, restarts the old leader, and verifies catch-up | Divergent replica truncation/rebootstrap, dynamic ISR, unkeyed/client-SDK routing |
+| Partition leader failover | `scripts/partition-leader-failover-smoke.sh` | Detects a failed partition leader, promotes only an assigned replica with a complete committed prefix, refreshes keyed client metadata, continues writes/reads, restarts the old leader, and verifies catch-up | Divergent replica truncation/rebootstrap and voter-set changes |
+| Replica reassignment | `scripts/reassignment-smoke.sh` | Stages removal of one replica, finalizes only after ISR validation, adds the replica back, verifies background catch-up and ISR admission, finalizes, and reads committed records from the re-added broker | Divergent replica truncation/rebootstrap, controller snapshot recovery, rack-aware placement |
 | Data integrity | `scripts/data-integrity.sh` | Storage, replication, offsets, delivery, record metadata, and recovery suites | All possible multi-process data corruption scenarios |
 | Microbenchmark | `scripts/benchmark.sh` | Relative CPU/allocation cost of performance primitives | End-to-end broker throughput or production latency |
 | Single-broker crash recovery | `scripts/crash-restart.sh` | Synchronously acknowledged local record remains readable after SIGKILL/restart on same data directory | Replica recovery or leader failover |
-| Docker Compose | `deploy/docker-compose.yml` | Three broker processes, membership, fixed-voter controller elections, controller-committed assignments, synchronous replication, and separate named volumes | Dynamic ISR/reassignment and secure peer transport |
-| Kubernetes | `deploy/kubernetes/` | Three StatefulSet pods with stable identities and per-pod PVCs, subject to a working StorageClass; fixed-voter elections, committed assignments, replication, and in-set partition failover when deployed with the expected config | Dynamic ISR/reassignment, secure peer transport, and end-to-end consumer routing |
+| Docker Compose | `deploy/docker-compose.yml` | Three broker processes, membership, fixed-voter controller elections, controller-committed assignments, synchronous replication, and separate named volumes | Secret/certificate provisioning, production network policy and live container deployment were not exercised in this environment |
+| Kubernetes | `deploy/kubernetes/` | Three StatefulSet pods with stable identities and per-pod PVCs, headless peer discovery, client ClusterIP service, and HTTP health probes | Requires a real cluster/StorageClass; deployment, storage behavior, security secrets, and runtime failover were not executed here |
 
 ## Repeatable local validation
 
-Run `scripts/validate.sh` for full tests, race detection, command builds, and `go vet`.
+Run `scripts/validate.sh` for full tests, race detection, command builds, and `go vet`. Run `scripts/smoke-all.sh` for all multi-process smoke scripts, including staged replica reassignment.
 
 Run `scripts/membership-smoke.sh` to exercise broker discovery across three processes. Run `scripts/replication-smoke.sh` to exercise synchronous static-assignment replication, durable commit markers, committed-read filtering, and MinISR behavior. Run `scripts/controller-election-smoke.sh` to exercise a durable fixed-voter controller election, stop the elected controller process, verify a replacement election, and restart the old voter from persisted term/vote/log/commit state. Run `scripts/controller-metadata-smoke.sh` to verify committed registrations and partition assignments on all brokers and the METADATA/data path. Run `scripts/partition-leader-failover-smoke.sh` to stop a data-partition leader, verify controller-committed promotion and keyed client rerouting, then restart the old leader and verify it catches up.
 
@@ -67,9 +68,9 @@ Do not make benchmark nanoseconds a hard pass/fail gate until there is a stable 
 
 - Commit broker registration and partition assignments through the live controller Raft log and apply committed metadata on every broker.
 - Make committed controller metadata authoritative for replica sets and partition leader epochs.
-- Extend safe partition promotion with dynamic ISR membership, staged replica reassignment, and a snapshot/truncation/rebootstrap path for replicas with divergent uncommitted suffixes.
+- Preserve dynamic ISR and staged reassignment behavior; add a snapshot/truncation/rebootstrap path for replicas with divergent uncommitted suffixes.
 - Extend client routing to unkeyed produce and consumer fetch, and provide a reusable client metadata cache with bounded retries.
-- Add authenticated/TLS-protected peer communication and safe voter reconfiguration.
+- Add peer certificate identity binding, certificate/secret rotation, and safe voter reconfiguration. Peer TLS/mTLS is implemented but identity binding and rotation are not.
 - Expose topic administration, group membership, and offset APIs over the versioned protocol.
 - Integrate API-key auth/ACLs and secure client TLS.
 - Validate data format migration and corruption handling.

@@ -3,11 +3,13 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +35,16 @@ type Config struct {
 	Timeout     time.Duration
 	MetadataTTL time.Duration
 	MaxRetries  int
+	// TLSConfig enables TLS/mTLS. When ServerName is empty, the broker
+	// hostname from each advertised address is used for certificate checks.
+	TLSConfig *tls.Config
+	// APIKey is sent in an AUTH request on every newly opened connection.
+	APIKey string
+}
+
+type metadataCacheEntry struct {
+	metadata protocol.MetadataResponse
+	loadedAt time.Time
 }
 
 type Client struct {
@@ -41,11 +53,12 @@ type Client struct {
 	ttl       time.Duration
 	retries   int
 
-	mu       sync.Mutex
-	metadata protocol.MetadataResponse
-	loadedAt time.Time
-	round    map[string]uint64
-	sequence atomic.Uint32
+	mu        sync.Mutex
+	metadata  map[string]metadataCacheEntry
+	round     map[string]uint64
+	sequence  atomic.Uint32
+	tlsConfig *tls.Config
+	apiKey    string
 }
 
 func New(cfg Config) (*Client, error) {
@@ -67,7 +80,11 @@ func New(cfg Config) (*Client, error) {
 	if cfg.MaxRetries < 0 {
 		return nil, fmt.Errorf("messlessmq client: negative retry count")
 	}
-	return &Client{bootstrap: addresses, timeout: cfg.Timeout, ttl: cfg.MetadataTTL, retries: cfg.MaxRetries, round: make(map[string]uint64)}, nil
+	client := &Client{bootstrap: addresses, timeout: cfg.Timeout, ttl: cfg.MetadataTTL, round: make(map[string]uint64), metadata: make(map[string]metadataCacheEntry), apiKey: cfg.APIKey}
+	if cfg.TLSConfig != nil {
+		client.tlsConfig = cfg.TLSConfig.Clone()
+	}
+	return client, nil
 }
 
 func (c *Client) Metadata(ctx context.Context, topic string) (protocol.MetadataResponse, error) {
@@ -75,8 +92,9 @@ func (c *Client) Metadata(ctx context.Context, topic string) (protocol.MetadataR
 		return protocol.MetadataResponse{}, ErrNoBootstrap
 	}
 	c.mu.Lock()
-	if !c.loadedAt.IsZero() && time.Since(c.loadedAt) < c.ttl {
-		cached := cloneMetadata(c.metadata)
+	entry, exists := c.metadata[topic]
+	if exists && time.Since(entry.loadedAt) < c.ttl {
+		cached := cloneMetadata(entry.metadata)
 		c.mu.Unlock()
 		return cached, nil
 	}
@@ -85,6 +103,8 @@ func (c *Client) Metadata(ctx context.Context, topic string) (protocol.MetadataR
 }
 
 func (c *Client) refresh(ctx context.Context, topic string) (protocol.MetadataResponse, error) {
+	// Cache each topic filter independently. This preserves topic-scoped ACLs
+	// and prevents a response for one topic from being reused for another.
 	payload, err := protocol.EncodeMetadataRequest(protocol.MetadataRequest{Topic: topic})
 	if err != nil {
 		return protocol.MetadataResponse{}, err
@@ -102,10 +122,11 @@ func (c *Client) refresh(ctx context.Context, topic string) (protocol.MetadataRe
 			continue
 		}
 		c.mu.Lock()
-		if c.loadedAt.IsZero() || metadata.Version >= c.metadata.Version {
-			c.metadata, c.loadedAt = cloneMetadata(metadata), time.Now()
+		current, exists := c.metadata[topic]
+		if !exists || metadata.Version >= current.metadata.Version {
+			c.metadata[topic] = metadataCacheEntry{metadata: cloneMetadata(metadata), loadedAt: time.Now()}
 		}
-		out := cloneMetadata(c.metadata)
+		out := cloneMetadata(c.metadata[topic].metadata)
 		c.mu.Unlock()
 		return out, nil
 	}
@@ -225,8 +246,26 @@ func (c *Client) routeForPartition(metadata protocol.MetadataResponse, topic str
 }
 
 func (c *Client) request(ctx context.Context, address string, api, version uint16, payload []byte) (protocol.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	dialer := net.Dialer{Timeout: c.timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	var conn net.Conn
+	var err error
+	if c.tlsConfig != nil {
+		config := c.tlsConfig.Clone()
+		if config.ServerName == "" {
+			host, _, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return protocol.Response{}, fmt.Errorf("parse TLS broker address %q: %w", address, splitErr)
+			}
+			config.ServerName = strings.Trim(host, "[]")
+		}
+		tlsDialer := tls.Dialer{NetDialer: &dialer, Config: config}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", address)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", address)
+	}
 	if err != nil {
 		return protocol.Response{}, err
 	}
@@ -235,7 +274,36 @@ func (c *Client) request(ctx context.Context, address string, api, version uint1
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
 	}
-	_ = conn.SetDeadline(deadline)
+	if err := conn.SetDeadline(deadline); err != nil {
+		return protocol.Response{}, err
+	}
+	if c.apiKey != "" {
+		authPayload, encodeErr := protocol.EncodeAuthRequest(protocol.AuthRequest{Token: c.apiKey})
+		if encodeErr != nil {
+			return protocol.Response{}, encodeErr
+		}
+		authResponse, authErr := c.exchange(conn, protocol.APIAUTH, protocol.AuthAPIVersion, authPayload)
+		if authErr != nil {
+			return protocol.Response{}, fmt.Errorf("authenticate broker connection: %w", authErr)
+		}
+		if _, decodeErr := protocol.DecodeAuthResponse(authResponse.Payload); decodeErr != nil {
+			return protocol.Response{}, fmt.Errorf("decode broker authentication response: %w", decodeErr)
+		}
+	}
+	return c.exchange(conn, api, version, payload)
+}
+
+// Request sends one versioned protocol request to a specific broker. It is
+// useful for administrative/client APIs that need a known broker address;
+// normal producers and consumers should use Produce and Consume for routing.
+func (c *Client) Request(ctx context.Context, address string, api, version uint16, payload []byte) (protocol.Response, error) {
+	if c == nil || address == "" {
+		return protocol.Response{}, ErrNoBootstrap
+	}
+	return c.request(ctx, address, api, version, payload)
+}
+
+func (c *Client) exchange(conn net.Conn, api, version uint16, payload []byte) (protocol.Response, error) {
 	frame, err := protocol.EncodeRequest(protocol.Request{APIKey: api, APIVersion: version, CorrelationID: c.sequence.Add(1), Payload: payload})
 	if err != nil {
 		return protocol.Response{}, err

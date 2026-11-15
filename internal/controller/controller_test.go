@@ -18,6 +18,38 @@ func register(id string) Command {
 	return Command{Type: CommandRegisterBroker, Broker: Broker{ID: id, Address: "127.0.0.1:9000"}}
 }
 
+func TestAppendRequestFromBuildsIncrementalSuffix(t *testing.T) {
+	node, err := newNode("leader", []string{"follower"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := node.BeginElection(); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.recordVote("follower", VoteResponse{Term: 1, VoteGranted: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.winElection(); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"broker-1", "broker-2", "broker-3"} {
+		if _, err := node.appendLocal(register(id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := node.appendRequestFrom(3)
+	if request.PreviousLogIndex != 2 || request.PreviousLogTerm != 1 || len(request.Entries) != 1 {
+		t.Fatalf("incremental append request = %+v", request)
+	}
+	if request.Entries[0].Index != 3 || request.Entries[0].Command.Broker.ID != "broker-3" {
+		t.Fatalf("unexpected incremental suffix: %+v", request.Entries)
+	}
+	last := node.appendRequestFrom(99)
+	if last.PreviousLogIndex != 3 || len(last.Entries) != 0 {
+		t.Fatalf("heartbeat at end of log = %+v", last)
+	}
+}
+
 func TestElectionRequiresMajority(t *testing.T) {
 	cluster := mustCluster(t, "a", "b", "c")
 	if err := cluster.SetLink("a", "b", false); err != nil {

@@ -19,7 +19,3 @@ spec:
       port: 19093
       targetPort: peer
       protocol: TCP
-    - name: admin
-      port: 9093
-      targetPort: admin
-      protocol: TCP

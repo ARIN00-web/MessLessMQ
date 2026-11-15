@@ -39,3 +39,6 @@ Thumbs.db
 # Local broker runtime data (topics, identity, partition logs)
 data/
 logs/
+
+# Locally generated development TLS credentials
+/deploy/secrets/

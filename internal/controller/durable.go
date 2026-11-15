@@ -238,6 +238,13 @@ func (d *DurableNode) AppendLocal(command Command) (LogEntry, error) {
 
 func (d *DurableNode) AppendRequest() AppendEntriesRequest { return d.node.appendRequest() }
 
+// AppendRequestFrom returns an incremental replication request beginning at
+// the supplied one-based follower nextIndex. It is safe to call concurrently
+// with proposals because the underlying Node snapshots its log under lock.
+func (d *DurableNode) AppendRequestFrom(nextIndex uint64) AppendEntriesRequest {
+	return d.node.appendRequestFrom(nextIndex)
+}
+
 func (d *DurableNode) CommitCurrentTermEntry(replicated int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()

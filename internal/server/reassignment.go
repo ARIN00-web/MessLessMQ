@@ -66,9 +66,12 @@ func (s *Server) StageReassignment(ctx context.Context, topic string, partitionI
 	if s == nil || s.controllerNode == nil || s.controllerRuntime == nil || ctx == nil || len(targets) == 0 {
 		return controller.PartitionAssignment{}, controller.ErrInvalidConfig
 	}
-	current, err := s.reassignmentCurrent(topic, partitionID)
+	current, metadataVersion, err := s.reassignmentCurrent(topic, partitionID)
 	if err != nil {
 		return controller.PartitionAssignment{}, err
+	}
+	if len(targets) < s.cfg.MinISR {
+		return controller.PartitionAssignment{}, fmt.Errorf("target replica count %d is below MinISR %d: %w", len(targets), s.cfg.MinISR, controller.ErrMetadataConflict)
 	}
 	if len(current.ReassignmentTarget) != 0 {
 		return controller.PartitionAssignment{}, controller.ErrMetadataConflict
@@ -88,7 +91,7 @@ func (s *Server) StageReassignment(ctx context.Context, topic string, partitionI
 	next := current
 	next.Replicas, next.ISR = union, append([]string(nil), current.ISR...)
 	next.ReassignmentTarget, next.LeaderEpoch = append([]string(nil), targets...), current.LeaderEpoch+1
-	if err := s.controllerRuntime.Propose(ctx, controller.Command{Type: controller.CommandAssignPartition, Assignment: next}); err != nil {
+	if err := s.controllerRuntime.ProposeAtVersion(ctx, controller.Command{Type: controller.CommandAssignPartition, Assignment: next}, metadataVersion); err != nil {
 		return controller.PartitionAssignment{}, err
 	}
 	s.applyCommittedControllerMetadata()
@@ -101,7 +104,7 @@ func (s *Server) FinalizeReassignment(ctx context.Context, topic string, partiti
 	if s == nil || s.controllerNode == nil || s.controllerRuntime == nil || ctx == nil {
 		return controller.PartitionAssignment{}, controller.ErrInvalidConfig
 	}
-	current, err := s.reassignmentCurrent(topic, partitionID)
+	current, metadataVersion, err := s.reassignmentCurrent(topic, partitionID)
 	if err != nil {
 		return controller.PartitionAssignment{}, err
 	}
@@ -123,23 +126,23 @@ func (s *Server) FinalizeReassignment(ctx context.Context, topic string, partiti
 		next.Leader = next.Replicas[0]
 	}
 	next.LeaderEpoch++
-	if err := s.controllerRuntime.Propose(ctx, controller.Command{Type: controller.CommandAssignPartition, Assignment: next}); err != nil {
+	if err := s.controllerRuntime.ProposeAtVersion(ctx, controller.Command{Type: controller.CommandAssignPartition, Assignment: next}, metadataVersion); err != nil {
 		return controller.PartitionAssignment{}, err
 	}
 	s.applyCommittedControllerMetadata()
 	return s.controllerNode.Metadata().Partitions[current.Key], nil
 }
 
-func (s *Server) reassignmentCurrent(topic string, partitionID uint32) (controller.PartitionAssignment, error) {
-	if topic == "" {
-		return controller.PartitionAssignment{}, controller.ErrInvalidCommand
+func (s *Server) reassignmentCurrent(topic string, partitionID uint32) (controller.PartitionAssignment, uint64, error) {
+	if topic == "" || s == nil || s.controllerNode == nil {
+		return controller.PartitionAssignment{}, 0, controller.ErrInvalidCommand
 	}
 	snapshot := s.controllerNode.Metadata()
 	current, ok := snapshot.Partitions[controller.PartitionKey{Topic: topic, Partition: int(partitionID)}]
 	if !ok {
-		return controller.PartitionAssignment{}, controller.ErrMetadataConflict
+		return controller.PartitionAssignment{}, 0, controller.ErrMetadataConflict
 	}
-	return current, nil
+	return current, snapshot.Version, nil
 }
 
 func validateReassignmentTargets(targets []string, metadata controller.MetadataSnapshot, current controller.PartitionAssignment) error {

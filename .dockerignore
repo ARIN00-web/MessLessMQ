@@ -10,3 +10,6 @@ benchmarks*
 data/
 logs/
 node_modules/
+
+# Never send local TLS private keys/certificates into the build context
+deploy/secrets/

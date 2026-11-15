@@ -1,0 +1,153 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: messlessmq
+  namespace: messlessmq
+  labels:
+    app.kubernetes.io/name: messlessmq
+spec:
+  serviceName: messlessmq-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: messlessmq
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: messlessmq
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: broker
+        image: messlessmq:integrated
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: MESSLESSMQ_BROKER_ID
+          value: $(POD_NAME)
+        - name: MESSLESSMQ_LISTEN_ADDRESS
+          value: :9092
+        - name: MESSLESSMQ_CLUSTER_ID
+          value: messlessmq-kubernetes
+        - name: MESSLESSMQ_CONTROLLER_VOTERS
+          value: messlessmq-0,messlessmq-1,messlessmq-2
+        - name: MESSLESSMQ_MIN_ISR
+          value: '2'
+        - name: MESSLESSMQ_PEER_LISTEN_ADDRESS
+          value: :19093
+        - name: MESSLESSMQ_PEER_ADVERTISE_ADDRESS
+          value: $(POD_NAME).messlessmq-headless.messlessmq.svc.cluster.local:19093
+        - name: MESSLESSMQ_SEEDS
+          value: messlessmq-0@messlessmq-0.messlessmq-headless.messlessmq.svc.cluster.local:19093
+        - name: MESSLESSMQ_PEER_JOIN_TIMEOUT
+          value: 90s
+        - name: MESSLESSMQ_ADMIN_ADDRESS
+          value: :9093
+        - name: MESSLESSMQ_ADVERTISE_ADDRESS
+          value: $(POD_NAME).messlessmq-headless.messlessmq.svc.cluster.local:9092
+        - name: MESSLESSMQ_DATA_DIR
+          value: /var/lib/messlessmq
+        - name: MESSLESSMQ_BOOTSTRAP_TOPICS
+          value: orders:3
+        - name: MESSLESSMQ_LOG_LEVEL
+          value: info
+        - name: MESSLESSMQ_TLS_CERT_FILE
+          value: /etc/messlessmq/tls/$(POD_NAME).crt
+        - name: MESSLESSMQ_TLS_KEY_FILE
+          value: /etc/messlessmq/tls/$(POD_NAME).key
+        - name: MESSLESSMQ_TLS_CLIENT_CA_FILE
+          value: /etc/messlessmq/tls/ca.crt
+        - name: MESSLESSMQ_REQUIRE_CLIENT_CERT
+          value: 'true'
+        - name: MESSLESSMQ_PEER_TLS_CERT_FILE
+          value: /etc/messlessmq/tls/$(POD_NAME).crt
+        - name: MESSLESSMQ_PEER_TLS_KEY_FILE
+          value: /etc/messlessmq/tls/$(POD_NAME).key
+        - name: MESSLESSMQ_PEER_TLS_CA_FILE
+          value: /etc/messlessmq/tls/ca.crt
+        - name: MESSLESSMQ_REQUIRE_PEER_CERT
+          value: 'true'
+        - name: MESSLESSMQ_CLIENT_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: messlessmq-auth
+              key: client-api-key
+        - name: MESSLESSMQ_ADMIN_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: messlessmq-auth
+              key: admin-api-key
+        ports:
+        - name: client
+          containerPort: 9092
+          protocol: TCP
+        - name: peer
+          containerPort: 19093
+          protocol: TCP
+        - name: admin
+          containerPort: 9093
+          protocol: TCP
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/messlessmq
+        - name: tls
+          mountPath: /etc/messlessmq/tls
+          readOnly: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        startupProbe:
+          tcpSocket:
+            port: client
+          periodSeconds: 2
+          failureThreshold: 30
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: admin
+            scheme: HTTP
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: admin
+            scheme: HTTP
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
+      volumes:
+      - name: tls
+        secret:
+          secretName: messlessmq-tls
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 5Gi

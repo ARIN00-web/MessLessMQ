@@ -1,11 +1,97 @@
-# Security
+# MessLessMQ security configuration
 
-Client listeners support TLS/mTLS through `TLS_CERT_FILE`, `TLS_KEY_FILE`, `TLS_CLIENT_CA_FILE`, and `REQUIRE_CLIENT_CERT`.
+Security features are opt-in for backwards compatibility. The base Compose and Kubernetes manifests are local development/lab configurations. Do not expose their peer/admin listeners to untrusted networks.
 
-Inter-broker traffic can be protected with `PEER_TLS_CERT_FILE`, `PEER_TLS_KEY_FILE`, and `PEER_TLS_CA_FILE`. Set `REQUIRE_PEER_CERT=true` to require mTLS. Peer clients derive the expected TLS server name from the advertised peer host, so certificates must include the DNS name or IP address used in peer addresses.
+## Client listener TLS and mTLS
 
-TLS is opt-in for backward compatibility. A secured cluster must configure identical trust roots and appropriate per-broker certificates on every peer; mixing plaintext and TLS peers is unsupported. Envelope identities and persisted cluster IDs continue to provide application-level consistency checks, but certificate subject-to-broker-ID authorization is not yet implemented.
+Set `MESSLESSMQ_TLS_CERT_FILE` and `MESSLESSMQ_TLS_KEY_FILE`. For mutual TLS, also set `MESSLESSMQ_TLS_CLIENT_CA_FILE` and `MESSLESSMQ_REQUIRE_CLIENT_CERT=true`.
 
-Set `ADMIN_API_KEY` to protect admin and diagnostic endpoints with `Authorization: Bearer <key>`. Liveness and readiness remain unauthenticated for Kubernetes probes. Keep the key in a secret manager or Kubernetes Secret; the broker never logs it.
+The Go client accepts a `*tls.Config`; the CLI accepts:
 
-Set `CLIENT_API_KEY` to require the binary `AUTH` API v1 before PRODUCE, CONSUME, METADATA, or GROUP requests on a TCP connection. Set `CLIENT_ACL` to semicolon-separated `role:topic:action` entries. Valid actions are `produce`, `consume`, `metadata`, and `group`; topic and action support `*`. The configured key uses the `client` role. When `CLIENT_ACL` is omitted, this role retains backward-compatible wildcard access.
+- `MESSLESSMQ_TLS_CA_FILE`
+- `MESSLESSMQ_TLS_CLIENT_CERT_FILE`
+- `MESSLESSMQ_TLS_CLIENT_KEY_FILE`
+- `MESSLESSMQ_TLS_SERVER_NAME` (optional; derived from broker address when omitted)
+
+## Peer TLS and mTLS
+
+Set `MESSLESSMQ_PEER_TLS_CERT_FILE`, `MESSLESSMQ_PEER_TLS_KEY_FILE`, and `MESSLESSMQ_PEER_TLS_CA_FILE`. Set `MESSLESSMQ_REQUIRE_PEER_CERT=true` to require a trusted client certificate on peer RPCs. All advertised peer hostnames must appear in the relevant certificate SANs.
+
+Peer TLS verifies CA trust and hostnames, but the application does not yet bind the peer certificate subject/SAN to the envelope's claimed broker ID. Use a trusted private network and issue broker-specific certificates. Certificate rotation/reload is not implemented; restart brokers with the rotated material.
+
+## Client AUTH and ACL
+
+Set `MESSLESSMQ_CLIENT_API_KEY` to require binary AUTH v1 on every new client TCP connection. Set `MESSLESSMQ_CLIENT_ACL` to semicolon-separated `role:topic:action` rules. The current configuration creates one principal with role `client`; without an explicit ACL the role has wildcard permissions for backwards compatibility. Protect API keys in a secret manager and use TLS because the AUTH token is otherwise visible to a network observer.
+
+The current runtime does not provide multi-principal credential administration or hot credential rotation.
+
+## Admin HTTP
+
+Set `MESSLESSMQ_ADMIN_API_KEY` to require `Authorization: Bearer <key>` for admin/diagnostic routes. Liveness and readiness remain unauthenticated for orchestrator probes. Bind admin listeners to private interfaces and apply network policy/firewall rules.
+
+## Local development certificates
+
+Run:
+
+```bash
+./scripts/generate-dev-certs.sh
+```
+
+This creates a local CA and broker/client certificates under `deploy/secrets/`. That directory is git-ignored. The generated CA private key must never be copied into broker containers or committed. These certificates are for local development only.
+
+### Secure Docker Compose overlay
+
+Export two strong random values in your shell:
+
+```bash
+export MESSLESSMQ_CLIENT_API_KEY="$(openssl rand -hex 32)"
+export MESSLESSMQ_ADMIN_API_KEY="$(openssl rand -hex 32)"
+```
+
+Start the secure overlay:
+
+```bash
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.secure.yml up --build -d
+```
+
+For a host-side CLI connection to broker-1, use the broker's certificate name while connecting to the published port:
+
+```bash
+export MESSLESSMQ_CLIENT_API_KEY
+export MESSLESSMQ_TLS_CA_FILE="$PWD/deploy/secrets/ca.crt"
+export MESSLESSMQ_TLS_CLIENT_CERT_FILE="$PWD/deploy/secrets/client.crt"
+export MESSLESSMQ_TLS_CLIENT_KEY_FILE="$PWD/deploy/secrets/client.key"
+export MESSLESSMQ_TLS_SERVER_NAME=broker-1
+./messlessmq-client metadata -addr 127.0.0.1:19092 -topic orders
+```
+
+The Compose cluster advertises container DNS names for broker-to-broker and routed client traffic. Run routed clients inside the Compose network or provide externally reachable per-broker advertised addresses; a single bootstrap port-forward is not sufficient for metadata-directed routing.
+
+### Secure Kubernetes overlay
+
+Create the TLS secret using the per-ordinal certificate files generated by the script:
+
+```bash
+kubectl -n messlessmq create secret generic messlessmq-tls \
+  --from-file=ca.crt=deploy/secrets/ca.crt \
+  --from-file=messlessmq-0.crt=deploy/secrets/messlessmq-0.crt \
+  --from-file=messlessmq-0.key=deploy/secrets/messlessmq-0.key \
+  --from-file=messlessmq-1.crt=deploy/secrets/messlessmq-1.crt \
+  --from-file=messlessmq-1.key=deploy/secrets/messlessmq-1.key \
+  --from-file=messlessmq-2.crt=deploy/secrets/messlessmq-2.crt \
+  --from-file=messlessmq-2.key=deploy/secrets/messlessmq-2.key
+```
+
+```bash
+kubectl -n messlessmq create secret generic messlessmq-auth \
+  --from-literal=client-api-key="$MESSLESSMQ_CLIENT_API_KEY" \
+  --from-literal=admin-api-key="$MESSLESSMQ_ADMIN_API_KEY"
+```
+
+Apply the secure overlay after creating both secrets:
+
+```bash
+kubectl apply -k deploy/kubernetes/secure/
+```
+
+The TLS secret volume contains broker keys/certificates and the CA certificate, not the CA private key. The Kubernetes client service advertises a cluster-internal bootstrap endpoint; clients still need DNS/network access to the individual broker addresses returned in METADATA.
