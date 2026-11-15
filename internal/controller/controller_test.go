@@ -362,3 +362,64 @@ func TestNewClusterRejectsInvalidMembership(t *testing.T) {
 		}
 	}
 }
+
+func TestBrokerAddressUpdate(t *testing.T) {
+	cluster := mustCluster(t, "a", "b", "c")
+
+	if err := cluster.Campaign("a"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cluster.Commit(register("broker-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	update := Command{
+		Type: CommandUpdateBrokerAddress,
+		Broker: Broker{
+			ID:      "broker-1",
+			Address: "127.0.0.1:19092",
+		},
+	}
+
+	if err := cluster.Commit(update); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"a", "b", "c"} {
+		metadata, err := cluster.Metadata(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		broker, exists := metadata.Brokers["broker-1"]
+		if !exists {
+			t.Fatalf("broker-1 missing from metadata on %s", id)
+		}
+
+		if broker.Address != "127.0.0.1:19092" {
+			t.Fatalf("broker address on %s = %q, want 127.0.0.1:19092",
+				id, broker.Address)
+		}
+	}
+}
+
+func TestBrokerAddressUpdateRequiresRegisteredBroker(t *testing.T) {
+	cluster := mustCluster(t, "a", "b", "c")
+
+	if err := cluster.Campaign("a"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cluster.Commit(Command{
+		Type: CommandUpdateBrokerAddress,
+		Broker: Broker{
+			ID:      "unknown",
+			Address: "127.0.0.1:19092",
+		},
+	})
+
+	if !errors.Is(err, ErrBrokerNotRegistered) {
+		t.Fatalf("Commit error = %v, want ErrBrokerNotRegistered", err)
+	}
+}

@@ -126,6 +126,12 @@ func validateCommandShape(command Command) error {
 		return nil
 	default:
 		return ErrInvalidCommand
+
+	case CommandUpdateBrokerAddress:
+		if strings.TrimSpace(command.Broker.ID) == "" ||
+			strings.TrimSpace(command.Broker.Address) == "" {
+			return ErrInvalidCommand
+		}
 	}
 	return nil
 }
@@ -174,6 +180,10 @@ func (m *metadataState) validate(command Command) error {
 		if !leaderInISR {
 			return ErrInvalidCommand
 		}
+	case CommandUpdateBrokerAddress:
+		if _, exists := m.brokers[command.Broker.ID]; !exists {
+			return ErrBrokerNotRegistered
+		}
 	}
 	return nil
 }
@@ -200,6 +210,8 @@ func (m *metadataState) apply(command Command) error {
 		m.partitions[command.Assignment.Key] = current
 	case CommandNoop:
 		return nil
+	case CommandUpdateBrokerAddress:
+		m.brokers[command.Broker.ID] = command.Broker
 	}
 	m.version++
 	return nil

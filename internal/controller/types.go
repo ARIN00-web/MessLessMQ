@@ -70,6 +70,7 @@ const (
 	CommandAssignPartition
 	CommandUpdatePartitionISR
 	CommandNoop
+	CommandUpdateBrokerAddress
 )
 
 type Command struct {

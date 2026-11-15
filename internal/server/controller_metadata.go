@@ -123,7 +123,21 @@ func (s *Server) reconcileControllerMetadata(parent context.Context) error {
 	for _, member := range brokers {
 		if existing, exists := metadata.Brokers[member.ID]; exists {
 			if existing.Address != member.ClientAddress {
-				return fmt.Errorf("broker %s changed advertised client address from %s to %s; update requires an explicit metadata reassignment", member.ID, existing.Address, member.ClientAddress)
+				ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+				err := s.controllerRuntime.Propose(ctx, controller.Command{
+					Type: controller.CommandUpdateBrokerAddress,
+					Broker: controller.Broker{
+						ID:      member.ID,
+						Address: member.ClientAddress,
+					},
+				})
+				cancel()
+
+				if err != nil {
+					return fmt.Errorf("update advertised client address for broker %s: %w", member.ID, err)
+				}
+
+				metadata = s.controllerNode.Metadata()
 			}
 			continue
 		}
