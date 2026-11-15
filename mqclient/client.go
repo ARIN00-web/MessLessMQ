@@ -27,7 +27,46 @@ var (
 type ResponseError struct{ Code uint16 }
 
 func (e *ResponseError) Error() string {
-	return fmt.Sprintf("messlessmq broker returned error code %d", e.Code)
+	switch e.Code {
+	case protocol.ErrorUnknownAPI:
+		return "messlessmq broker: unknown API request (error 1)"
+	case protocol.ErrorInvalidRequest:
+		return "messlessmq broker: invalid request payload or parameters (error 2)"
+	case protocol.ErrorInternal:
+		return "messlessmq broker: internal broker failure (error 3)"
+	case protocol.ErrorInvalidAckMode:
+		return "messlessmq broker: unsupported or invalid acknowledgement mode (error 4)"
+	case protocol.ErrorMessageTooLarge:
+		return "messlessmq broker: message exceeds maximum size (error 5)"
+	case protocol.ErrorUnknownTopic:
+		return "messlessmq broker: topic not found (error 6)"
+	case protocol.ErrorPartitionNotFound:
+		return "messlessmq broker: partition not found (error 7)"
+	case protocol.ErrorOffsetOutOfRange:
+		return "messlessmq broker: requested offset out of range (error 8)"
+	case protocol.ErrorOffsetBeforeStart:
+		return "messlessmq broker: requested offset before start offset (deleted by retention) (error 9)"
+	case protocol.ErrorInvalidFetchLimit:
+		return "messlessmq broker: invalid fetch limit (error 10)"
+	case protocol.ErrorUnsupportedVersion:
+		return "messlessmq broker: unsupported protocol version (error 11)"
+	case protocol.ErrorRateLimited:
+		return "messlessmq broker: request rate limit exceeded (error 12)"
+	case protocol.ErrorNotPartitionLeader:
+		return "messlessmq broker: not partition leader (error 13)"
+	case protocol.ErrorInsufficientISR:
+		return "messlessmq broker: insufficient in-sync replicas (ISR) to satisfy MinISR durability (error 14)"
+	case protocol.ErrorCommitUncertain:
+		return "messlessmq broker: commit outcome uncertain (error 15)"
+	case protocol.ErrorControllerAuthorityUnavailable:
+		return "messlessmq broker: controller authority lease expired or unavailable (error 16)"
+	case protocol.ErrorUnauthorized:
+		return "messlessmq broker: authentication failure (error 17)"
+	case protocol.ErrorForbidden:
+		return "messlessmq broker: authorization forbidden (error 18)"
+	default:
+		return fmt.Sprintf("messlessmq broker returned error code %d", e.Code)
+	}
 }
 
 type Config struct {
@@ -40,6 +79,8 @@ type Config struct {
 	TLSConfig *tls.Config
 	// APIKey is sent in an AUTH request on every newly opened connection.
 	APIKey string
+	// EndpointResolver optionally rewrites a broker's advertised address for routing.
+	EndpointResolver func(brokerID string, advertisedAddr string) string
 }
 
 type metadataCacheEntry struct {
@@ -53,12 +94,13 @@ type Client struct {
 	ttl       time.Duration
 	retries   int
 
-	mu        sync.Mutex
-	metadata  map[string]metadataCacheEntry
-	round     map[string]uint64
-	sequence  atomic.Uint32
-	tlsConfig *tls.Config
-	apiKey    string
+	mu               sync.Mutex
+	metadata         map[string]metadataCacheEntry
+	round            map[string]uint64
+	sequence         atomic.Uint32
+	tlsConfig        *tls.Config
+	apiKey           string
+	endpointResolver func(brokerID string, advertisedAddr string) string
 }
 
 func New(cfg Config) (*Client, error) {
@@ -80,7 +122,15 @@ func New(cfg Config) (*Client, error) {
 	if cfg.MaxRetries < 0 {
 		return nil, fmt.Errorf("messlessmq client: negative retry count")
 	}
-	client := &Client{bootstrap: addresses, timeout: cfg.Timeout, ttl: cfg.MetadataTTL, round: make(map[string]uint64), metadata: make(map[string]metadataCacheEntry), apiKey: cfg.APIKey}
+	client := &Client{
+		bootstrap:        addresses,
+		timeout:          cfg.Timeout,
+		ttl:              cfg.MetadataTTL,
+		round:            make(map[string]uint64),
+		metadata:         make(map[string]metadataCacheEntry),
+		apiKey:           cfg.APIKey,
+		endpointResolver: cfg.EndpointResolver,
+	}
 	if cfg.TLSConfig != nil {
 		client.tlsConfig = cfg.TLSConfig.Clone()
 	}
@@ -237,12 +287,55 @@ func (c *Client) routeForPartition(metadata protocol.MetadataResponse, topic str
 		if partition.Topic == topic && partition.PartitionID == partitionID {
 			for _, broker := range metadata.Brokers {
 				if broker.ID == partition.Leader {
-					return partition, broker.Address, nil
+					addr := c.resolveBrokerAddress(broker.ID, broker.Address)
+					return partition, addr, nil
 				}
 			}
 		}
 	}
 	return protocol.PartitionMetadata{}, "", ErrNoRoute
+}
+
+func (c *Client) resolveBrokerAddress(brokerID, advertisedAddr string) string {
+	if c.endpointResolver != nil {
+		if resolved := c.endpointResolver(brokerID, advertisedAddr); resolved != "" {
+			return resolved
+		}
+	}
+	return ResolveAddressWithBootstrap(advertisedAddr, c.bootstrap, brokerID)
+}
+
+// ResolveAddressWithBootstrap adapts advertised broker addresses to client network context.
+// When connecting to an external machine or Docker container, advertised loopback addresses
+// are remapped using the reachable bootstrap host.
+func ResolveAddressWithBootstrap(advertisedAddr string, bootstrapAddresses []string, brokerID string) string {
+	if len(bootstrapAddresses) == 0 {
+		return advertisedAddr
+	}
+	advHost, advPort, err := net.SplitHostPort(advertisedAddr)
+	if err != nil {
+		return advertisedAddr
+	}
+	isAdvLoopback := advHost == "127.0.0.1" || strings.ToLower(advHost) == "localhost" || advHost == "::1"
+
+	for _, boot := range bootstrapAddresses {
+		bootHost, bootPort, bootErr := net.SplitHostPort(boot)
+		if bootErr != nil {
+			continue
+		}
+		isBootLoopback := bootHost == "127.0.0.1" || strings.ToLower(bootHost) == "localhost" || bootHost == "::1"
+
+		// Container-internal client: dialed via internal port 9092, map directly to broker ID on container network
+		if isAdvLoopback && bootPort == "9092" && brokerID != "" {
+			return net.JoinHostPort(brokerID, "9092")
+		}
+
+		// External network client: dialed a non-loopback host (remote IP/DNS), but broker returned loopback
+		if isAdvLoopback && !isBootLoopback {
+			return net.JoinHostPort(bootHost, advPort)
+		}
+	}
+	return advertisedAddr
 }
 
 func (c *Client) request(ctx context.Context, address string, api, version uint16, payload []byte) (protocol.Response, error) {

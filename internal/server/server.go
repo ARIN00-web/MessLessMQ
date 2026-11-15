@@ -29,6 +29,7 @@ import (
 	"github.com/ARIN00-web/messlessmq/internal/protocol"
 	"github.com/ARIN00-web/messlessmq/internal/replication"
 	"github.com/ARIN00-web/messlessmq/internal/security"
+	"github.com/ARIN00-web/messlessmq/internal/storage"
 	"github.com/ARIN00-web/messlessmq/internal/topic"
 )
 
@@ -45,6 +46,7 @@ type Server struct {
 	cfg                config.Config
 	adminAddr          string
 	logger             *slog.Logger
+	dirLock            *storage.DirLock
 	registry           *topic.Registry
 	topics             []*topic.Topic
 	dispatch           *broker.Dispatcher
@@ -90,6 +92,16 @@ func New(options Options) (*Server, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
+	dirLock, err := storage.LockDir(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("lock data directory: %w", err)
+	}
+	var lockSuccess bool
+	defer func() {
+		if !lockSuccess {
+			_ = dirLock.Unlock()
+		}
+	}()
 	if cfg.PeerListenAddress != "" {
 		if err := membership.EnsureIdentity(cfg.DataDir, cfg.ClusterID, cfg.BrokerID); err != nil {
 			return nil, fmt.Errorf("verify persistent broker identity: %w", err)
@@ -137,17 +149,21 @@ func New(options Options) (*Server, error) {
 				_ = closeTopics(opened)
 				return nil, fmt.Errorf("read initial range for %s:%d: %w", registeredTopic.Name(), partition.ID(), rangeErr)
 			}
-			leaderID, leaderEpoch, initialHighWatermark := cfg.BrokerID, uint64(1), logEnd
-			if assignment, assigned := assignments[partitionKey{Topic: registeredTopic.Name(), PartitionID: partition.ID()}]; assigned {
-				leaderID, leaderEpoch, initialHighWatermark = assignment.LeaderID, assignment.LeaderEpoch, startOffset
-			}
-			state, initErr := commits.Initialize(registeredTopic.Name(), partition.ID(), initialHighWatermark, logEnd, leaderID, leaderEpoch)
-			if initErr != nil {
-				_ = closeTopics(opened)
-				return nil, fmt.Errorf("initialize commit state for %s:%d: %w", registeredTopic.Name(), partition.ID(), initErr)
+			state, exists := commits.Get(registeredTopic.Name(), partition.ID())
+			if !exists {
+				leaderID, leaderEpoch, initialHighWatermark := cfg.BrokerID, uint64(1), logEnd
+				if assignment, assigned := assignments[partitionKey{Topic: registeredTopic.Name(), PartitionID: partition.ID()}]; assigned {
+					leaderID, leaderEpoch, initialHighWatermark = assignment.LeaderID, assignment.LeaderEpoch, startOffset
+				}
+				var initErr error
+				state, initErr = commits.Initialize(registeredTopic.Name(), partition.ID(), initialHighWatermark, logEnd, leaderID, leaderEpoch)
+				if initErr != nil {
+					_ = closeTopics(opened)
+					return nil, fmt.Errorf("initialize commit state for %s:%d: %w", registeredTopic.Name(), partition.ID(), initErr)
+				}
 			}
 			if state.HighWatermark < startOffset {
-				if _, advanceErr := commits.Advance(registeredTopic.Name(), partition.ID(), startOffset, leaderID, leaderEpoch, logEnd); advanceErr != nil {
+				if _, advanceErr := commits.Advance(registeredTopic.Name(), partition.ID(), startOffset, state.LeaderID, state.LeaderEpoch, logEnd); advanceErr != nil {
 					_ = closeTopics(opened)
 					return nil, fmt.Errorf("advance commit state after retention for %s:%d: %w", registeredTopic.Name(), partition.ID(), advanceErr)
 				}
@@ -311,6 +327,7 @@ func New(options Options) (*Server, error) {
 	}
 	server := &Server{
 		cfg: cfg, adminAddr: strings.TrimSpace(options.AdminAddress), logger: options.Logger,
+		dirLock:  dirLock,
 		registry: registry, topics: opened, dispatch: dispatcher, controls: operations.NewControls(),
 		limiter: limiter, metrics: metrics, requests: requests, failures: failures,
 		produced: produced, consumed: consumed, latency: latency, members: members, seeds: seeds,
@@ -325,6 +342,7 @@ func New(options Options) (*Server, error) {
 	if server.controllerRuntime != nil {
 		server.controllerRuntime.onCommit = server.applyCommittedControllerMetadata
 	}
+	lockSuccess = true
 	return server, nil
 }
 
@@ -718,8 +736,37 @@ acceptLoop:
 			runErr = errors.Join(runErr, err)
 		}
 	}
+	if s.dirLock != nil {
+		if err := s.dirLock.Unlock(); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+		s.dirLock = nil
+	}
 	s.logger.Info("broker stopped", "broker_id", s.cfg.BrokerID)
 	return runErr
+}
+
+// Close gracefully releases server resources including topic logs, offsets, and data directory lock.
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	var errs []error
+	if err := closeTopics(s.topics); err != nil {
+		errs = append(errs, err)
+	}
+	if s.offsetStore != nil {
+		if err := s.offsetStore.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.dirLock != nil {
+		if err := s.dirLock.Unlock(); err != nil {
+			errs = append(errs, err)
+		}
+		s.dirLock = nil
+	}
+	return errors.Join(errs...)
 }
 
 func isClosedListener(err error) bool {

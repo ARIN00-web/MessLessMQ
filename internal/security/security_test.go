@@ -196,3 +196,112 @@ func TestRateLimitMiddleware(t *testing.T) {
 		}
 	}
 }
+
+func TestMTLSRejectsMissingClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile, caFile := writeTestCertificate(t, dir)
+
+	serverTLS, err := LoadServerTLS(certFile, keyFile, caFile, true)
+	if err != nil {
+		t.Fatalf("LoadServerTLS: %v", err)
+	}
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatalf("tls.Listen: %v", err)
+	}
+	defer listener.Close()
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		defer conn.Close()
+		// Handshake should fail during TLS negotiation.
+		tlsConn, ok := conn.(*tls.Conn)
+		if ok {
+			serverErrCh <- tlsConn.Handshake()
+		} else {
+			serverErrCh <- nil
+		}
+	}()
+
+	// Client trusts server CA, but supplies NO client certificate.
+	clientTLS, err := LoadClientTLS(caFile, "localhost")
+	if err != nil {
+		t.Fatalf("LoadClientTLS: %v", err)
+	}
+
+	conn, err := tls.Dial("tcp", listener.Addr().String(), clientTLS)
+	if err == nil {
+		_ = conn.Close()
+		serverErr := <-serverErrCh
+		if serverErr == nil {
+			t.Fatal("mTLS accepted client connection without a client certificate")
+		}
+	}
+	// Handshake rejection is expected.
+}
+
+func TestTLSRejectsExpiredCertificate(t *testing.T) {
+	dir := t.TempDir()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expired certificate (NotAfter in the past).
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		DNSNames:              []string{"localhost"},
+		NotBefore:             time.Now().Add(-2 * time.Hour),
+		NotAfter:              time.Now().Add(-1 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER := x509.MarshalPKCS1PrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyDER})
+	certFile := filepath.Join(dir, "expired.crt")
+	keyFile := filepath.Join(dir, "expired.key")
+	_ = os.WriteFile(certFile, certPEM, 0600)
+	_ = os.WriteFile(keyFile, keyPEM, 0600)
+
+	serverTLS, err := LoadServerTLS(certFile, keyFile, "", false)
+	if err != nil {
+		t.Fatalf("LoadServerTLS: %v", err)
+	}
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatalf("tls.Listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	clientTLS, err := LoadClientTLS(certFile, "localhost")
+	if err != nil {
+		t.Fatalf("LoadClientTLS: %v", err)
+	}
+
+	conn, err := tls.Dial("tcp", listener.Addr().String(), clientTLS)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("client accepted expired certificate")
+	}
+}

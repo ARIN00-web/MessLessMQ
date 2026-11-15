@@ -189,3 +189,54 @@ func testTLSCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	roots.AddCert(parsed)
 	return certificate, roots
 }
+
+func TestResolveAddressWithBootstrap(t *testing.T) {
+	// Loopback bootstrap and loopback advertised: untouched
+	got := ResolveAddressWithBootstrap("127.0.0.1:19092", []string{"127.0.0.1:19092"}, "broker-1")
+	if got != "127.0.0.1:19092" {
+		t.Fatalf("got %q, want 127.0.0.1:19092", got)
+	}
+
+	// External bootstrap host rewrites loopback advertised host
+	got = ResolveAddressWithBootstrap("127.0.0.1:19093", []string{"192.168.1.50:19092"}, "broker-2")
+	if got != "192.168.1.50:19093" {
+		t.Fatalf("got %q, want 192.168.1.50:19093", got)
+	}
+
+	// In-container client dialing via port 9092 rewrites to container name
+	got = ResolveAddressWithBootstrap("127.0.0.1:19093", []string{"broker-1:9092"}, "broker-2")
+	if got != "broker-2:9092" {
+		t.Fatalf("got %q, want broker-2:9092", got)
+	}
+
+	// Non-loopback advertised address is preserved
+	got = ResolveAddressWithBootstrap("k8s-broker-2:9092", []string{"127.0.0.1:19092"}, "broker-2")
+	if got != "k8s-broker-2:9092" {
+		t.Fatalf("got %q, want k8s-broker-2:9092", got)
+	}
+}
+
+func TestCustomEndpointResolver(t *testing.T) {
+	c, err := New(Config{
+		Bootstrap: []string{"127.0.0.1:19092"},
+		EndpointResolver: func(brokerID string, advertisedAddr string) string {
+			return fmt.Sprintf("custom-%s:9999", brokerID)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := protocol.MetadataResponse{
+		Brokers: []protocol.BrokerMetadata{{ID: "b1", Address: "127.0.0.1:19092"}},
+		Partitions: []protocol.PartitionMetadata{
+			{Topic: "orders", PartitionID: 0, Leader: "b1"},
+		},
+	}
+	_, addr, err := c.routeForPartition(metadata, "orders", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "custom-b1:9999" {
+		t.Fatalf("got %q, want custom-b1:9999", addr)
+	}
+}

@@ -423,3 +423,90 @@ func TestBrokerAddressUpdateRequiresRegisteredBroker(t *testing.T) {
 		t.Fatalf("Commit error = %v, want ErrBrokerNotRegistered", err)
 	}
 }
+
+func TestNetworkPartitionAndMajorityConvergence(t *testing.T) {
+	// 5-node cluster: a, b, c, d, e. Majority is 3.
+	cluster := mustCluster(t, "a", "b", "c", "d", "e")
+
+	// Elect "a" as initial leader.
+	if err := cluster.Campaign("a"); err != nil {
+		t.Fatalf("initial campaign failed: %v", err)
+	}
+
+	// Commit initial command on leader "a".
+	if err := cluster.Commit(register("broker-1")); err != nil {
+		t.Fatalf("initial commit failed: %v", err)
+	}
+
+	// Partition the network into minority {a, b} and majority {c, d, e}.
+	minority := []string{"a", "b"}
+	majority := []string{"c", "d", "e"}
+	for _, minNode := range minority {
+		for _, majNode := range majority {
+			if err := cluster.SetLink(minNode, majNode, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Proposals on minority {a, b} must fail due to lack of quorum.
+	if err := cluster.Commit(register("broker-stale")); !errors.Is(err, ErrNoQuorum) {
+		t.Fatalf("minority commit error = %v, want ErrNoQuorum", err)
+	}
+
+	// Majority {c, d, e} can campaign and elect "c".
+	if err := cluster.Campaign("c"); err != nil {
+		t.Fatalf("majority campaign for c failed: %v", err)
+	}
+	if got := cluster.CurrentLeader(); got != "c" {
+		t.Fatalf("current leader = %q, want c", got)
+	}
+
+	// Leader "c" can commit new commands within majority quorum.
+	if err := cluster.Commit(register("broker-2")); err != nil {
+		t.Fatalf("majority commit broker-2 failed: %v", err)
+	}
+	if err := cluster.Commit(register("broker-3")); err != nil {
+		t.Fatalf("majority commit broker-3 failed: %v", err)
+	}
+
+	// Heal the network partition.
+	for _, minNode := range minority {
+		for _, majNode := range majority {
+			if err := cluster.SetLink(minNode, majNode, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Sync surviving followers "a" and "b" from new leader "c".
+	if err := cluster.SyncFollower("a"); err != nil {
+		t.Fatalf("sync follower a failed: %v", err)
+	}
+	if err := cluster.SyncFollower("b"); err != nil {
+		t.Fatalf("sync follower b failed: %v", err)
+	}
+
+	// Verify all 5 nodes converged to the exact same metadata and log state.
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		metadata, err := cluster.Metadata(id)
+		if err != nil {
+			t.Fatalf("Metadata(%s) failed: %v", id, err)
+		}
+		if len(metadata.Brokers) != 3 {
+			t.Fatalf("node %s has %d brokers, want 3", id, len(metadata.Brokers))
+		}
+		if _, ok := metadata.Brokers["broker-stale"]; ok {
+			t.Fatalf("node %s has uncommitted broker-stale in metadata", id)
+		}
+		for _, brokerID := range []string{"broker-1", "broker-2", "broker-3"} {
+			if _, ok := metadata.Brokers[brokerID]; !ok {
+				t.Fatalf("node %s missing %s in metadata", id, brokerID)
+			}
+		}
+		status := mustNodeStatus(t, cluster, id)
+		if status.CommitIndex != 3 || status.AppliedIndex != 3 {
+			t.Fatalf("node %s commit/applied = %d/%d, want 3/3", id, status.CommitIndex, status.AppliedIndex)
+		}
+	}
+}

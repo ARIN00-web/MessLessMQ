@@ -101,9 +101,19 @@ func (r *Registry) Register(clusterID string, broker Broker) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if current, exists := r.brokers[broker.ID]; exists {
-		if current != broker {
+	if broker.ID == r.self.ID {
+		if broker.PeerAddress != r.self.PeerAddress {
 			return fmt.Errorf("broker %q: %w", broker.ID, ErrBrokerConflict)
+		}
+		return nil
+	}
+	if current, exists := r.brokers[broker.ID]; exists {
+		if current.PeerAddress != broker.PeerAddress {
+			return fmt.Errorf("broker %q: %w", broker.ID, ErrBrokerConflict)
+		}
+		if current.ClientAddress != broker.ClientAddress {
+			r.brokers[broker.ID] = broker
+			r.version++
 		}
 		return nil
 	}

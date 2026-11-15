@@ -136,6 +136,7 @@ func (s *Server) reconcileControllerMetadata(parent context.Context) error {
 				if err != nil {
 					return fmt.Errorf("update advertised client address for broker %s: %w", member.ID, err)
 				}
+				s.logger.Info("committed broker address update", "broker_id", member.ID, "old_address", existing.Address, "new_address", member.ClientAddress)
 
 				metadata = s.controllerNode.Metadata()
 			}
@@ -166,15 +167,10 @@ func (s *Server) reconcileControllerMetadata(parent context.Context) error {
 			continue
 		}
 		controllerKey := controller.PartitionKey{Topic: key.Topic, Partition: int(key.PartitionID)}
-		if existing, exists := metadata.Partitions[controllerKey]; exists {
-			if !assignmentMatches(existing, desired) {
-				if len(existing.ReassignmentTarget) != 0 {
-					continue
-				}
-				// Existing committed metadata is authoritative. Reassignment uses a
-				// separate staged workflow; startup reconciliation never overwrites it.
-				return fmt.Errorf("committed assignment for %s:%d differs from configured desired assignment", key.Topic, key.PartitionID)
-			}
+		if _, exists := metadata.Partitions[controllerKey]; exists {
+			// Existing committed metadata is authoritative. Failovers and reassignments
+			// are managed through their respective workflows; startup reconciliation
+			// never overwrites existing committed partition metadata.
 			continue
 		}
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)

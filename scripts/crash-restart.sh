@@ -10,7 +10,7 @@ if ! command -v nc >/dev/null 2>&1; then
 fi
 
 BROKER_HOST="127.0.0.1"
-BROKER_PORT="19092"
+BROKER_PORT="${BROKER_PORT:-29092}"
 BROKER_ADDR="${BROKER_HOST}:${BROKER_PORT}"
 if nc -z "$BROKER_HOST" "$BROKER_PORT" >/dev/null 2>&1; then
   echo "Port ${BROKER_PORT} is already in use; stop that process before running this test." >&2

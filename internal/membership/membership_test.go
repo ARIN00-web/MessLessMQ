@@ -130,6 +130,46 @@ func TestRegisterRejectsAddressConflict(t *testing.T) {
 	}
 }
 
+func TestRegisterUpdatesClientAddressWhenPeerAddressMatches(t *testing.T) {
+	registry, err := NewRegistry("cluster-a", testBroker("broker-a", "127.0.0.1:19091"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := Broker{ID: "broker-b", ClientAddress: "127.0.0.1:9092", PeerAddress: "127.0.0.1:19092"}
+	if err := registry.Register("cluster-a", initial); err != nil {
+		t.Fatal(err)
+	}
+	updated := Broker{ID: "broker-b", ClientAddress: "127.0.0.1:19093", PeerAddress: "127.0.0.1:19092"}
+	if err := registry.Register("cluster-a", updated); err != nil {
+		t.Fatalf("Register updated address: %v", err)
+	}
+	b, ok := registry.Broker("broker-b")
+	if !ok {
+		t.Fatal("broker-b not found")
+	}
+	if b.ClientAddress != "127.0.0.1:19093" {
+		t.Fatalf("broker-b ClientAddress = %q, want 127.0.0.1:19093", b.ClientAddress)
+	}
+	if registry.Snapshot().Version != 3 {
+		t.Fatalf("snapshot version = %d, want 3", registry.Snapshot().Version)
+	}
+}
+
+func TestRegisterIgnoresStaleSnapshotForSelf(t *testing.T) {
+	registry, err := NewRegistry("cluster-a", Broker{ID: "broker-a", ClientAddress: "127.0.0.1:19092", PeerAddress: "127.0.0.1:19091"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleSelf := Broker{ID: "broker-a", ClientAddress: "127.0.0.1:9092", PeerAddress: "127.0.0.1:19091"}
+	if err := registry.Register("cluster-a", staleSelf); err != nil {
+		t.Fatalf("Register stale self should succeed: %v", err)
+	}
+	self := registry.Self()
+	if self.ClientAddress != "127.0.0.1:19092" {
+		t.Fatalf("self ClientAddress was overwritten = %q", self.ClientAddress)
+	}
+}
+
 func TestParseSeeds(t *testing.T) {
 	seeds, err := ParseSeeds([]string{"broker-1@127.0.0.1:19091", " broker-2@localhost:19092 "})
 	if err != nil {

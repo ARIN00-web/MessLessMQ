@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAppendAndRead(t *testing.T) {
@@ -302,5 +303,80 @@ func TestSegmentFilesUseBaseOffsets(t *testing.T) {
 
 	if timeIndexFiles != 3 {
 		t.Errorf("time index files = %d, want 3", timeIndexFiles)
+	}
+}
+
+func TestConcurrentSegmentReadWriteRoll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "concurrent-roll")
+	// Set maxSegmentBytes small (200 bytes) so segments roll frequently during appends.
+	l, err := OpenLogWithSegmentSize(path, 200)
+	if err != nil {
+		t.Fatalf("OpenLogWithSegmentSize: %v", err)
+	}
+	defer l.Close()
+
+	const numWriters = 4
+	const recordsPerWriter = 50
+	const totalRecords = numWriters * recordsPerWriter
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	// Launch writers
+	for w := 0; w < numWriters; w++ {
+		wg.Add(1)
+		go func(writerID int) {
+			defer wg.Done()
+			<-start
+			for r := 0; r < recordsPerWriter; r++ {
+				data := []byte(fmt.Sprintf("writer-%02d-record-%04d", writerID, r))
+				if _, err := l.Append(data); err != nil {
+					t.Errorf("Append failed: %v", err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Launch concurrent readers
+	const numReaders = 3
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				next := l.NextOffset()
+				if next > 0 {
+					target := next / 2
+					_, err := l.Read(target)
+					if err != nil && !errors.Is(err, ErrOffsetNotFound) {
+						t.Errorf("Read(%d) error: %v", target, err)
+					}
+				}
+				if next >= totalRecords {
+					break
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	if l.NextOffset() != totalRecords {
+		t.Fatalf("NextOffset = %d, want %d", l.NextOffset(), totalRecords)
+	}
+
+	// Verify all records can be read without corruption.
+	for i := uint64(0); i < totalRecords; i++ {
+		data, err := l.Read(i)
+		if err != nil {
+			t.Fatalf("Read(%d) failed: %v", i, err)
+		}
+		if len(data) == 0 {
+			t.Fatalf("Read(%d) returned empty data", i)
+		}
 	}
 }

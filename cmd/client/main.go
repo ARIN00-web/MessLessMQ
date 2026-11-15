@@ -59,7 +59,46 @@ type brokerResponseError struct {
 }
 
 func (e *brokerResponseError) Error() string {
-	return fmt.Sprintf("broker returned error code %d", e.Code)
+	switch e.Code {
+	case protocol.ErrorUnknownAPI:
+		return "broker error: unknown API request (error 1)"
+	case protocol.ErrorInvalidRequest:
+		return "broker error: invalid request payload or parameters (error 2)"
+	case protocol.ErrorInternal:
+		return "broker error: internal broker failure (error 3)"
+	case protocol.ErrorInvalidAckMode:
+		return "broker error: unsupported or invalid acknowledgement mode (error 4)"
+	case protocol.ErrorMessageTooLarge:
+		return "broker error: message exceeds maximum size (error 5)"
+	case protocol.ErrorUnknownTopic:
+		return "broker error: topic not found (error 6)"
+	case protocol.ErrorPartitionNotFound:
+		return "broker error: partition not found (error 7)"
+	case protocol.ErrorOffsetOutOfRange:
+		return "broker error: requested offset is out of range (beyond log end) (error 8)"
+	case protocol.ErrorOffsetBeforeStart:
+		return "broker error: requested offset is before start offset (compacted or deleted by retention) (error 9)"
+	case protocol.ErrorInvalidFetchLimit:
+		return "broker error: invalid fetch message count limit (error 10)"
+	case protocol.ErrorUnsupportedVersion:
+		return "broker error: unsupported protocol version (error 11)"
+	case protocol.ErrorRateLimited:
+		return "broker error: request rate limit exceeded (error 12)"
+	case protocol.ErrorNotPartitionLeader:
+		return "broker error: not partition leader (replica assignment changed or failover in progress) (error 13)"
+	case protocol.ErrorInsufficientISR:
+		return "broker error: insufficient in-sync replicas (ISR) to satisfy MinISR durability (error 14)"
+	case protocol.ErrorCommitUncertain:
+		return "broker error: commit outcome uncertain (leader persisted data but commit marker failed quorum) (error 15)"
+	case protocol.ErrorControllerAuthorityUnavailable:
+		return "broker error: controller authority lease expired or unavailable (error 16)"
+	case protocol.ErrorUnauthorized:
+		return "broker error: authentication failure (invalid or missing API key) (error 17)"
+	case protocol.ErrorForbidden:
+		return "broker error: authorization forbidden (ACL permission denied) (error 18)"
+	default:
+		return fmt.Sprintf("broker returned error code %d", e.Code)
+	}
 }
 
 func newClient(address string) (*mqclient.Client, error) {
@@ -137,7 +176,8 @@ func routeProduceAddress(bootstrapAddress, topicName string, key []byte) (string
 	}
 	for _, broker := range metadata.Brokers {
 		if broker.ID == selected.Leader {
-			return broker.Address, selected.PartitionID, nil
+			resolved := mqclient.ResolveAddressWithBootstrap(broker.Address, []string{bootstrapAddress}, broker.ID)
+			return resolved, selected.PartitionID, nil
 		}
 	}
 	return "", 0, fmt.Errorf("metadata has no address for partition leader %q", selected.Leader)

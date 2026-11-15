@@ -208,3 +208,32 @@ func TestParseBootstrapTopics(t *testing.T) {
 		t.Fatal("expected duplicate topic to fail")
 	}
 }
+
+func TestServerRejectsConcurrentInstanceOnSameDataDir(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "shared-data")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	first, err := New(Options{Config: testConfig(dataDir), BootstrapTopics: []TopicDefinition{{Name: "orders", Partitions: 1}}, Logger: logger})
+	if err != nil {
+		t.Fatalf("first New failed: %v", err)
+	}
+	defer first.Close()
+
+	// Second instance pointing to the same dataDir must fail because of directory flock.
+	second, err := New(Options{Config: testConfig(dataDir), BootstrapTopics: []TopicDefinition{{Name: "orders", Partitions: 1}}, Logger: logger})
+	if err == nil {
+		_ = second.Close()
+		t.Fatal("second New on same dataDir unexpectedly succeeded")
+	}
+
+	// Once the first server is closed, a new instance can acquire the directory lock.
+	if err := first.Close(); err != nil {
+		t.Fatalf("first.Close failed: %v", err)
+	}
+
+	third, err := New(Options{Config: testConfig(dataDir), BootstrapTopics: []TopicDefinition{{Name: "orders", Partitions: 1}}, Logger: logger})
+	if err != nil {
+		t.Fatalf("third New failed after first.Close: %v", err)
+	}
+	_ = third.Close()
+}
